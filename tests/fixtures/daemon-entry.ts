@@ -1,7 +1,7 @@
 // Test-only entrypoint. It never downloads a binary, creates a real tunnel,
 // registers WARP, sends a webhook, or installs a system service.
 import { join } from "node:path";
-import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createPaths, readConfig, nodeEngine, type CoreName } from "../../src/core.ts";
 import { runCoreHost, runDaemonWorker, type DaemonCoreCommand } from "../../src/daemon.ts";
 
@@ -53,6 +53,14 @@ try {
       skipPreflight: true,
       healthIntervalMs: 50,
       backoffBaseMs: 80,
+      ...(existsSync(join(root, "firewall-fixture.json")) ? {
+        firewall: async (originalPaths: typeof paths) => {
+          appendFileSync(join(root, "firewall-observed.jsonl"), JSON.stringify({ root: originalPaths.root, data: originalPaths.data }) + "\n");
+          const fixture = JSON.parse(readFileSync(join(root, "firewall-fixture.json"), "utf8"));
+          if (fixture.throw) throw new Error("Synthetic firewall exception");
+          return { backend: "windows" as const, status: "blocked" as const, changed: false, detail: "Synthetic blocked firewall", warnings: ["Synthetic policy warning"], rules: [] };
+        },
+      } : {}),
     });
   } else {
     throw new Error(`Unsupported test entrypoint mode: ${mode}`);
