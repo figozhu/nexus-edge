@@ -29,7 +29,7 @@ export async function selectMenu(title: string, information: string, choices: st
       if (information) console.log(information + "\n");
       console.log(`${uiAnsi.bold}${title}${uiAnsi.reset}\n`);
       choices.forEach((choice, index) => console.log(index === selected ? `${uiAnsi.cyan}  › ${index + 1}. ${choice}${uiAnsi.reset}` : `    ${index + 1}. ${choice}`));
-      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择 · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
+      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择${choices.length === 10 ? "（0 选第 10 项）" : ""} · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
     };
     const cleanup = () => {
       process.stdin.removeListener("keypress", onKey);
@@ -46,6 +46,7 @@ export async function selectMenu(title: string, information: string, choices: st
       else if (key.name === "down" || key.name === "j") selected = (selected + 1) % choices.length;
       else if (key.name === "return") { cleanup(); resolve(selected); return; }
       else if (/^[1-9]$/.test(text) && Number(text) <= choices.length) { cleanup(); resolve(Number(text) - 1); return; }
+      else if (text === "0" && choices.length === 10) { cleanup(); resolve(9); return; }
       else return;
       render();
     };

@@ -8,6 +8,9 @@ import { getDaemonStatus, stopDaemonGracefully, startDetachedDaemon, waitForRead
 import { type StartupStatus, isAdministrator, isSystemInstallation, discoverSystemInstallation, runElevated, getStartupStatus, enableStartup, disableStartup, startManaged, stopManaged } from "./platform.ts";
 import { selectMenu, promptInput, uiPause, uiValidatedInput, UserCancelledError, UiExitRequestedError } from "./ui.ts";
 import { configureSimpleNode, editConnectionAddress, repairNodeAddress, directListenerNotice, type SimplePanelServices } from "./simple.ts";
+import { getFirewallSettings } from "./core.ts";
+import { syncFirewallInteractive } from "./firewall-control.ts";
+import { firewallPanelSummary, printFirewallResult, requireFirewallApply, runFirewallPanel } from "./firewall-panel.ts";
 
 const panelProtocolLabels: Record<NodeProtocol, string> = {
   vless: "VLESS", vmess: "VMess", shadowsocks: "Shadowsocks / SS2022", trojan: "Trojan",
@@ -374,7 +377,11 @@ async function panelReadiness(paths: AppPaths): Promise<void> {
     for (const link of node.links) console.log(`${link.label}：${link.error || link.uri || "请从导出菜单取得客户端 JSON"}`);
     if (node.lastError) console.log(node.lastError);
   }
-  console.log("\n就绪检查确认本机监听及所选隧道连接。直连的公网端口 / NAT / 防火墙和客户端实际访问仍需现场验证。");
+  if (status.firewall) {
+    console.log(`\n后台防火墙检查（${status.firewall.backend} / ${status.firewall.status}）：${status.firewall.detail}`);
+    for (const warning of status.firewall.warnings) console.log(`防火墙提示：${warning}`);
+  }
+  console.log("\n就绪检查确认本机监听及所选隧道连接。云安全组、路由器 NAT、第三方安全软件和客户端实际访问仍需现场验证。");
   console.log("关闭面板后后台继续运行；部分节点未就绪时，其他已就绪节点可以继续使用。");
 }
 
@@ -382,23 +389,67 @@ async function panelStop(paths: AppPaths, startup: StartupStatus): Promise<void>
   if (startup.mode !== "none") await stopManaged(paths); else await stopDaemonGracefully(paths);
 }
 
-async function panelApplyConfiguration(paths: AppPaths, candidate: AppConfig): Promise<void> {
-  const current = await getDaemonStatus(paths);
-  if (panelRuntimeMatches(current, candidate, paths)) {
-    writeConfig(paths, candidate);
+export interface PanelRuntimeOperations {
+  getStatus: typeof getDaemonStatus;
+  prepare: typeof prepareRuntime;
+  syncFirewall: typeof syncFirewallInteractive;
+  getStartup: typeof getStartupStatus;
+  stop: typeof panelStop;
+  start: (paths: AppPaths, startup: StartupStatus) => Promise<void>;
+  readiness: typeof panelReadiness;
+  save: typeof writeConfig;
+}
+
+const panelRuntimeDefaults: PanelRuntimeOperations = {
+  getStatus: getDaemonStatus, prepare: prepareRuntime, syncFirewall: syncFirewallInteractive,
+  getStartup: getStartupStatus, stop: panelStop, readiness: panelReadiness, save: writeConfig,
+  start: async (paths, startup) => { if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths); },
+};
+
+/** Preflight and UAC run before the saved configuration or existing worker changes. */
+export async function panelApplyConfiguration(paths: AppPaths, input: AppConfig, options: { forceRestart?: boolean } = {}, overrides: Partial<PanelRuntimeOperations> = {}): Promise<void> {
+  const operations = { ...panelRuntimeDefaults, ...overrides };
+  const candidate = validateConfig(input, { allowExpiredCertificate: true });
+  const previous = readConfig(paths), expected = configFingerprint(previous);
+  const current = await operations.getStatus(paths);
+  const unchanged = !options.forceRestart && panelRuntimeMatches(current, candidate, paths);
+  if (!unchanged && candidate.nodes.some(node => node.enabled)) await operations.prepare(paths, candidate);
+  const firewall = await operations.syncFirewall(paths, candidate, { expectedConfigHash: expected, report: printFirewallResult });
+  requireFirewallApply(firewall);
+  if (configFingerprint(readConfig(paths)) !== expected) throw new Error("配置在准备过程中被修改，未覆盖新配置或停止原后台。请重新打开节点后应用。");
+  try { operations.save(paths, candidate); }
+  catch (error) {
+    if (firewall?.changed) {
+      try {
+        const restored = await operations.syncFirewall(paths, previous, { force: true, expectedConfigHash: expected, report: printFirewallResult });
+        if (restored && !["synced", "inactive"].includes(restored.status)) console.log("旧端口规则未完全恢复，请从防火墙菜单重新同步。");
+      } catch (restoreError) { console.log(`旧端口规则恢复未完成：${errorMessage(restoreError)}`); }
+    }
+    throw error;
+  }
+  if (unchanged) {
     console.log("配置已保存。服务端参数保持一致，后台继续运行；链接地址会自动刷新。");
     return;
   }
-  if (candidate.nodes.some(node => node.enabled)) await prepareRuntime(paths, candidate);
-  writeConfig(paths, candidate);
   try {
-    const startup = await getStartupStatus(paths);
-    await panelStop(paths, startup);
+    const startup = await operations.getStartup(paths);
+    await operations.stop(paths, startup);
     if (!candidate.nodes.some(node => node.enabled)) { console.log("已保存停用状态，并停止后台节点。"); return; }
-    if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths);
-    await panelReadiness(paths);
+    await operations.start(paths, startup);
+    await operations.readiness(paths);
   } catch (error) {
     console.log(`配置已保存，但后台应用未完成：${errorMessage(error)}\n处理后可从主菜单选择“启动 / 重启全部节点”重试。`);
+  }
+}
+
+/** Explicit stop removes owned rules after the worker stops; restart/update use panelStop directly. */
+export async function panelStopAll(paths: AppPaths, startup: StartupStatus, overrides: Partial<PanelRuntimeOperations> = {}): Promise<void> {
+  const operations = { ...panelRuntimeDefaults, ...overrides }, config = readConfig(paths);
+  await operations.stop(paths, startup);
+  console.log("后台及各节点核心已停止，自动启动设置保持不变。");
+  if (getFirewallSettings(config).mode === "auto") {
+    try { await operations.syncFirewall(paths, config, { remove: true, expectedConfigHash: configFingerprint(config), report: printFirewallResult }); }
+    catch (error) { console.log(`后台已停止；防火墙规则清理未完成：${errorMessage(error)}\n可从防火墙菜单重新清理。`); }
   }
 }
 
@@ -406,11 +457,13 @@ async function panelStartup(paths: AppPaths, current: StartupStatus): Promise<bo
   if (current.enabled) { await disableStartup(paths); console.log("自动启动已关闭，当前后台继续运行。需要停止时请选择停止全部节点。"); return false; }
   await prepareRuntime(paths);
   if (isSystemInstallation(paths)) {
+    requireFirewallApply(await syncFirewallInteractive(paths, readConfig(paths), { report: printFirewallResult }));
     await enableStartup(paths, "system"); await startManaged(paths); await panelReadiness(paths); return false;
   }
   const mode = process.platform === "win32" ? await selectMenu("自动启动模式", "系统模式会安装到受保护目录，需要时请求 UAC。用户模式只在该用户登录后运行。", ["系统开机启动（SYSTEM，无需登录）", "当前用户登录后启动", "取消"]) : await selectMenu("启用系统自启", "需要 systemd，程序将安装到 /opt/nexus-edge；必要时请求 sudo。", ["启用系统自启", "取消"]);
   if ((process.platform === "win32" && mode === 2) || (process.platform !== "win32" && mode === 1)) return false;
   if (mode === 1 && process.platform === "win32") {
+    requireFirewallApply(await syncFirewallInteractive(paths, readConfig(paths), { report: printFirewallResult }));
     await panelStop(paths, current); await enableStartup(paths, "user"); await startManaged(paths); await panelReadiness(paths); return false;
   }
   const requestId = panelCrypto.randomUUID();
@@ -436,20 +489,25 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       `后台：${status?.phase ?? "未运行"}    权限：${admin ? "管理员 / root" : "普通用户"}`,
       `节点：${config.nodes.length} 个（${enabled.length} 个启用）    隧道：${enabled.filter(node => node.tunnel.mode !== "none").length} 个`,
       `自启：${startup.detail}`, `数据：${paths.data}`,
+      firewallPanelSummary(paths, config),
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "退出面板（保留后台）"]);
-    if (choice === 8) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "防火墙 / 端口放行", "退出面板（保留后台）"]);
+    if (choice === 9) return "exit";
     try {
-      if (choice === 0) { await prepareRuntime(paths); await panelStop(paths, startup); if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths); await panelReadiness(paths); }
-      else if (choice === 1) { await panelStop(paths, startup); console.log("后台及各节点核心已停止，自动启动设置保持不变。"); }
+      if (choice === 0) {
+        if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
+        await panelApplyConfiguration(paths, config, { forceRestart: true });
+      }
+      else if (choice === 1) await panelStopAll(paths, startup);
       else if (choice === 2) { await panelManageNodes(paths); continue; }
       else if (choice === 3) { await panelExport(paths); continue; }
       else if (choice === 4) await panelSharedSettings(paths);
       else if (choice === 5) console.log(tailLog(paths));
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
+      else if (choice === 8) { await runFirewallPanel(paths); continue; }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;

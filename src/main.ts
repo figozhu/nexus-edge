@@ -6,10 +6,11 @@ import { isAdministrator, discoverSystemInstallation, isSystemInstallation, runE
 import { migrateSystemInstallation } from "./migration.ts";
 import { UserCancelledError, UiExitRequestedError, selectMenu } from "./ui.ts";
 import { runPanel } from "./panel.ts";
+import { runFirewallRequest } from "./firewall-control.ts";
 
 export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -17,6 +18,10 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   const version = Bun.version.split(".").map(Number);
   if ((version[0] ?? 0) < 1 || (version[0] === 1 && ((version[1] ?? 0) < 4 || (version[1] === 4 && (version[2] ?? 0) < 3)))) throw new Error("请使用 Bun 1.4.3 或更新版本。");
   const paths = createPaths(entry);
+  if (args[0] === "--firewall-request") {
+    if (args.length !== 2) throw new Error("防火墙辅助程序需要有效的单次请求 ID。");
+    return runFirewallRequest(paths, args[1]!);
+  }
   if (args[0] === "--core-host") return runCoreHost(args[1] ?? "", args.slice(2));
   if (args[0] === "--worker") { await runDaemonWorker(paths); return 0; }
   if (args[0] === "--stop-worker") { await stopDaemonGracefully(paths); return 0; }

@@ -8,6 +8,8 @@ import * as daemonDgram from "node:dgram";
 import * as daemonSqlite from "bun:sqlite";
 import { type AppConfig, type AppPaths, type RuntimeRecord, type DaemonStatus, type NodeConfig, type NodeRuntimeStatus, type CoreName, type CoreRuntimeStatus, type CoreProcessState, atomicWrite, ensureDataDir, readConfig, validateConfig, configFingerprint, runtimeConfigFingerprint, collectConfigSecrets, generateNodeLinks, nodeEngine, nodeListenNetworks, normalizeDomain, LineBuffer, redact, errorMessage, delay } from "./core.ts";
 import { ensureBinaries, preflightCores, buildCloudflaredArgs, readCoreSelection, initializeCoreSelection, coreReleaseFingerprint, type Binaries } from "./network.ts";
+import { syncFirewallBackground } from "./firewall-control.ts";
+import { type FirewallResult } from "./firewall.ts";
 
 export class InstanceBusyError extends Error {
   constructor() { super("同一数据目录已有守护进程占用。请从管理面板停止它；不要删除锁文件或根据旧 PID 杀进程。"); }
@@ -291,6 +293,7 @@ export interface DaemonOptions {
   skipPreflight?: boolean;
   healthIntervalMs?: number;
   backoffBaseMs?: number;
+  firewall?: (paths: AppPaths, config: AppConfig) => Promise<FirewallResult | null>;
 }
 
 interface DaemonJob {
@@ -345,6 +348,20 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases });
     else if (!injectedAll) binaries = await ensureBinaries(paths, config, message => logger!.write(message), releases);
     if (abort.signal.aborted) return;
+    let firewall: DaemonStatus["firewall"];
+    if (options.firewall || !(injectedAll && options.skipPreflight)) {
+      try {
+        const result = await (options.firewall ?? syncFirewallBackground)(paths, config);
+        if (result) firewall = { status: result.status, backend: result.backend, detail: result.detail, warnings: result.warnings };
+      } catch (error) {
+        firewall = { status: "error", backend: "none", detail: `防火墙同步未完成：${errorMessage(error)}`, warnings: [] };
+      }
+      if (firewall) {
+        logger.write(`[firewall] ${firewall.status} / ${firewall.backend}：${firewall.detail}`);
+        for (const warning of firewall.warnings) logger.write(`[firewall] ${warning}`);
+      }
+    }
+    if (abort.signal.aborted) return;
     const runtime: RuntimeRecord = {
       schema: 1, instanceId, pid: process.pid, startedAt,
       controlPort: 0, controlToken: daemonCrypto.randomBytes(32).toString("hex"), configHash: configFingerprint(config),
@@ -359,7 +376,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         tunnelState: node.enabled && node.tunnel.mode !== "none" ? "starting" : "disabled", tunnelRestarts: 0,
         domain: node.tunnel.mode === "fixed" ? node.tunnel.domain : null,
         links: [], lastError: null, detail: node.enabled ? "等待本地核心监听。" : "节点已禁用，未启动监听或隧道。",
-      })), links: [], lastError: null,
+      })), links: [], lastError: null, ...(firewall ? { firewall } : {}),
     };
     const nodeStates = new Map(status.nodes.map(node => [node.id, node]));
     const nodeConfigs = new Map(config.nodes.map(node => [node.id, node]));

@@ -6,7 +6,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.2.1";
+export const APP_VERSION = "2.3.0";
 
 export interface WarpProfile {
   privateKey: string;
@@ -65,11 +65,20 @@ export interface NodeLink {
   error?: string;
 }
 
+export interface FirewallSettings {
+  mode: "auto" | "manual";
+  linuxBackend: "auto" | "ufw" | "firewalld" | "iptables";
+  /** Empty selects the active interface's zone without changing its assignment. */
+  firewalldZone: string;
+}
+
 export interface AppConfig {
   schema: 2;
   nodes: NodeConfig[];
   warp?: WarpProfile;
   webhook: { kind: "none" | "generic" | "feishu" | "wecom" | "dingtalk" | "bark"; url: string };
+  /** Older schema-2 configurations use automatic firewall management by default. */
+  firewall?: FirewallSettings;
 }
 
 export interface AppPaths {
@@ -133,6 +142,8 @@ export interface DaemonStatus {
   nodes: NodeRuntimeStatus[];
   links: NodeLink[];
   lastError: string | null;
+  /** Separate from local listener readiness; this does not prove public reachability. */
+  firewall?: { status: string; backend: string; detail: string; warnings: string[] };
 }
 
 export function assertSupportedPlatform(os = process.platform, cpu = process.arch): void {
@@ -496,6 +507,21 @@ function coreValidateWebhook(value: unknown): AppConfig["webhook"] {
   return { kind, url: kind === "none" ? "" : url };
 }
 
+export function validateFirewallSettings(value: unknown): FirewallSettings {
+  const settings = coreObject(value, "防火墙设置");
+  const firewalldZone = coreString(settings.firewalldZone, "firewalld zone", 32);
+  if (firewalldZone && !/^[a-zA-Z0-9_-]{1,32}$/.test(firewalldZone)) throw new Error("firewalld zone 只能包含字母、数字、下划线或连字符；留空可自动选择。");
+  return {
+    mode: coreChoice(settings.mode, ["auto", "manual"] as const, "防火墙管理模式"),
+    linuxBackend: coreChoice(settings.linuxBackend, ["auto", "ufw", "firewalld", "iptables"] as const, "Linux 防火墙管理器"),
+    firewalldZone,
+  };
+}
+
+export function getFirewallSettings(config: AppConfig): FirewallSettings {
+  return config.firewall === undefined ? { mode: "auto", linuxBackend: "auto", firewalldZone: "" } : validateFirewallSettings(config.firewall);
+}
+
 function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
   if (a.port !== b.port || !nodeListenNetworks(a).some(network => nodeListenNetworks(b).includes(network))) return false;
   if (a.listen === b.listen || a.listen === "::" || b.listen === "::") return true;
@@ -516,7 +542,7 @@ export function validateConfig(value: unknown, options: { allowExpiredCertificat
   }
   const warp = v.warp === undefined ? undefined : validateWarpProfile(v.warp);
   if (!warp && nodes.some(node => node.enabled && node.egress === "warp")) throw new Error("已启用的节点选择了 WARP 出站，但尚未配置有效的 WARP 凭据。");
-  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook) };
+  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
 }
 
 /** Convert only the released v1 shape; never reinterpret damaged legacy data. */
@@ -609,12 +635,13 @@ export function configFingerprint(config: AppConfig): string {
   return coreCrypto.createHash("sha256").update(JSON.stringify(validateConfig(config, { allowExpiredCertificate: true }))).digest("hex");
 }
 
-/** Direct client endpoint metadata may change without changing a running core.
+/** Client endpoint metadata and firewall preferences do not change a running core.
  * Keep every other field, including node names and shared settings, conservative. */
 export function runtimeConfigFingerprint(config: AppConfig): string {
   const normalized = validateConfig(config, { allowExpiredCertificate: true });
+  const { firewall: _firewall, ...coreSettings } = normalized;
   const runtimeConfig = {
-    ...normalized,
+    ...coreSettings,
     nodes: normalized.nodes.map(({ address: _address, publicPort: _publicPort, ...node }) => node),
   };
   return coreCrypto.createHash("sha256").update(JSON.stringify(runtimeConfig)).digest("hex");

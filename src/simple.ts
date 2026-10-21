@@ -6,6 +6,9 @@ import { type PublicAddressResult, type LocalAddressCandidate, detectPublicAddre
 import { SIMPLE_PROTOCOL_LABELS, createSimpleNode, applySimpleTunnel } from "./presets.ts";
 import { generateSelfSignedCertificate, generateVlessEncryption } from "./network.ts";
 import { selectMenu, promptInput, uiValidatedInput, UserCancelledError, UiExitRequestedError } from "./ui.ts";
+import { getFirewallSettings } from "./core.ts";
+import { buildFirewallPlan } from "./firewall.ts";
+import { firewallPortSummary } from "./firewall-panel.ts";
 
 export interface SimplePanelServices {
   detectAddresses: () => Promise<PublicAddressResult>;
@@ -261,7 +264,7 @@ async function simpleTunnel(node: NodeConfig): Promise<{ node: NodeConfig; prepa
   return { node: next, prepareEncryption, notice };
 }
 
-function simpleSummary(node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
+function simpleSummary(paths: AppPaths, config: AppConfig, node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
   const security = node.tls.mode === "reality" ? `REALITY（目标 ${node.tls.serverName}，密钥已准备）`
     : node.tls.mode === "tls" ? node.tls.certificatePem ? `TLS（已有证书，名称 ${node.tls.serverName}）` : "TLS（保存时自动生成独立证书，无需自备域名）"
     : node.protocol === "vless" ? prepareEncryption ? "ENC（保存时自动生成加密参数）" : node.vlessEncryption !== "none" ? "VLESS ENC" : "无附加 TLS / ENC"
@@ -274,6 +277,7 @@ function simpleSummary(node: NodeConfig, existing: boolean, notice: string, prep
     `客户端连接：${endpoint}`, `认证：${existing ? "保留已有凭据" : "已自动生成，可自行修改"}`,
     `安全设置：${security}`, `隧道：${tunnel}；${node.direct ? "直连接入开启" : "直连接入关闭"}`,
     `节点状态：${node.enabled ? "启用" : "停用"}；出口：${node.egress === "direct" ? "本机网络" : "WARP"}`,
+    getFirewallSettings(config).mode === "auto" ? `本机防火墙：应用时自动同步（${firewallPortSummary(buildFirewallPlan(paths, { ...config, nodes: [node] }).rules)}；需要时请求管理员授权）` : "本机防火墙：手动管理（可在主菜单开启自动放行）",
     ...(node.tunnel.mode === "fixed" ? [`Cloudflare 映射：${node.tunnel.domain} → http://${fixedOrigin.includes(":") ? `[${fixedOrigin}]` : fixedOrigin}:${node.port}`] : []),
     directListenerNotice(node), notice,
     "默认直接保存即可；只有自定义需求才需要高级配置。应用会重启当前后台，共享核心上的节点会短暂重连。",
@@ -300,7 +304,7 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
   for (;;) {
     const items = ["apply", "save", ...(["vless", "vmess"].includes(node.protocol) ? ["tunnel"] : []), "address", "auth", "advanced", "cancel"];
     const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: "名称与 UUID / 密码", advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
-    const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
+    const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(paths, config, node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
     if (selected === "cancel") throw new UserCancelledError();
     try {
       if (selected === "tunnel") {
