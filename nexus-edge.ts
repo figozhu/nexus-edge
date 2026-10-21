@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 2.2.1 — stable core defaults, simple multi-protocol setup, optional tunnels.
+ * NexusEdge 2.3.0 — automatic firewall ports, stable cores, multi-protocol nodes and optional tunnels.
  * Run: bun nexus-edge.ts
  * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.
  * Generated from the typed source modules using scripts/build.ts.
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.2.1";
+export const APP_VERSION = "2.3.0";
 
 export interface WarpProfile {
   privateKey: string;
@@ -75,11 +75,20 @@ export interface NodeLink {
   error?: string;
 }
 
+export interface FirewallSettings {
+  mode: "auto" | "manual";
+  linuxBackend: "auto" | "ufw" | "firewalld" | "iptables";
+  /** Empty selects the active interface's zone without changing its assignment. */
+  firewalldZone: string;
+}
+
 export interface AppConfig {
   schema: 2;
   nodes: NodeConfig[];
   warp?: WarpProfile;
   webhook: { kind: "none" | "generic" | "feishu" | "wecom" | "dingtalk" | "bark"; url: string };
+  /** Older schema-2 configurations use automatic firewall management by default. */
+  firewall?: FirewallSettings;
 }
 
 export interface AppPaths {
@@ -143,6 +152,8 @@ export interface DaemonStatus {
   nodes: NodeRuntimeStatus[];
   links: NodeLink[];
   lastError: string | null;
+  /** Separate from local listener readiness; this does not prove public reachability. */
+  firewall?: { status: string; backend: string; detail: string; warnings: string[] };
 }
 
 export function assertSupportedPlatform(os = process.platform, cpu = process.arch): void {
@@ -506,6 +517,21 @@ function coreValidateWebhook(value: unknown): AppConfig["webhook"] {
   return { kind, url: kind === "none" ? "" : url };
 }
 
+export function validateFirewallSettings(value: unknown): FirewallSettings {
+  const settings = coreObject(value, "防火墙设置");
+  const firewalldZone = coreString(settings.firewalldZone, "firewalld zone", 32);
+  if (firewalldZone && !/^[a-zA-Z0-9_-]{1,32}$/.test(firewalldZone)) throw new Error("firewalld zone 只能包含字母、数字、下划线或连字符；留空可自动选择。");
+  return {
+    mode: coreChoice(settings.mode, ["auto", "manual"] as const, "防火墙管理模式"),
+    linuxBackend: coreChoice(settings.linuxBackend, ["auto", "ufw", "firewalld", "iptables"] as const, "Linux 防火墙管理器"),
+    firewalldZone,
+  };
+}
+
+export function getFirewallSettings(config: AppConfig): FirewallSettings {
+  return config.firewall === undefined ? { mode: "auto", linuxBackend: "auto", firewalldZone: "" } : validateFirewallSettings(config.firewall);
+}
+
 function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
   if (a.port !== b.port || !nodeListenNetworks(a).some(network => nodeListenNetworks(b).includes(network))) return false;
   if (a.listen === b.listen || a.listen === "::" || b.listen === "::") return true;
@@ -526,7 +552,7 @@ export function validateConfig(value: unknown, options: { allowExpiredCertificat
   }
   const warp = v.warp === undefined ? undefined : validateWarpProfile(v.warp);
   if (!warp && nodes.some(node => node.enabled && node.egress === "warp")) throw new Error("已启用的节点选择了 WARP 出站，但尚未配置有效的 WARP 凭据。");
-  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook) };
+  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
 }
 
 /** Convert only the released v1 shape; never reinterpret damaged legacy data. */
@@ -619,12 +645,13 @@ export function configFingerprint(config: AppConfig): string {
   return coreCrypto.createHash("sha256").update(JSON.stringify(validateConfig(config, { allowExpiredCertificate: true }))).digest("hex");
 }
 
-/** Direct client endpoint metadata may change without changing a running core.
+/** Client endpoint metadata and firewall preferences do not change a running core.
  * Keep every other field, including node names and shared settings, conservative. */
 export function runtimeConfigFingerprint(config: AppConfig): string {
   const normalized = validateConfig(config, { allowExpiredCertificate: true });
+  const { firewall: _firewall, ...coreSettings } = normalized;
   const runtimeConfig = {
-    ...normalized,
+    ...coreSettings,
     nodes: normalized.nodes.map(({ address: _address, publicPort: _publicPort, ...node }) => node),
   };
   return coreCrypto.createHash("sha256").update(JSON.stringify(runtimeConfig)).digest("hex");
@@ -2675,7 +2702,7 @@ try {
   $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -PassThru -Wait
   exit $child.ExitCode
 } catch {
-  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，系统级自启尚未启用。'); exit 1223 }
+  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
   throw
 }`;
     result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { cwd: paths.root });
@@ -3142,6 +3169,1356 @@ export const platformInternals = {
 };
 
 
+// ==================== firewall-linux.ts ====================
+import * as linuxFirewallFs from "node:fs";
+import * as linuxFirewallPath from "node:path";
+import * as linuxFirewallNet from "node:net";
+import * as linuxFirewallCrypto from "node:crypto";
+import * as linuxFirewallSqlite from "bun:sqlite";
+
+/** The parent directory already exists and is private to this installation. No config/secrets are read here. */
+export interface LinuxFirewallContext { stateFile: string }
+type LinuxFirewallBackend = "ufw" | "firewalld" | "iptables" | "none";
+type LinuxFirewallReply = Awaited<ReturnType<FirewallCommandRunner>>;
+class LinuxFirewallFailure extends Error {
+  constructor(readonly status: FirewallResult["status"], message: string) { super(message); }
+}
+interface LinuxFirewallSession {
+  plan: FirewallPlan; runner: FirewallCommandRunner; backend: LinuxFirewallBackend; changed: boolean; warnings: string[];
+  context: LinuxFirewallContext; journal?: LinuxFirewallJournal;
+  ufwStatus?: string;
+}
+const linuxFirewallPermissionPattern = /permission denied|operation not permitted|must be root|need to be root|not authorized|not authorised|authorization.failed|access denied|authentication is required/i;
+function linuxFirewallFail(status: FirewallResult["status"], detail: string): never { throw new LinuxFirewallFailure(status, detail); }
+function linuxFirewallKey(rule: Omit<FirewallRule, "key">): string {
+  return linuxFirewallCrypto.createHash("sha256").update(JSON.stringify([rule.protocol, rule.port, rule.family, rule.destination])).digest("hex").slice(0, 16);
+}
+function linuxFirewallValidateRule(value: unknown): FirewallRule {
+  const r = value as FirewallRule;
+  if (!r || !["tcp", "udp"].includes(r.protocol) || !Number.isInteger(r.port) || r.port < 1 || r.port > 65535 || ![4, 6].includes(r.family) || typeof r.destination !== "string") linuxFirewallFail("blocked", "防火墙规则格式不合法。");
+  const wildcard = r.family === 4 ? "0.0.0.0/0" : "::/0";
+  if (r.destination !== wildcard && linuxFirewallNet.isIP(r.destination) !== r.family) linuxFirewallFail("blocked", "防火墙仅接受明确的本机 IP 或监听全部地址。");
+  if (r.destination !== wildcard) {
+    if ((r.family === 4 && (r.destination.startsWith("127.") || r.destination === "0.0.0.0")) || (r.family === 6 && (r.destination === "::1" || r.destination === "::" || r.destination.startsWith("::ffff:") || new URL(`http://[${r.destination}]/`).hostname.slice(1, -1) !== r.destination))) linuxFirewallFail("blocked", "防火墙状态记录含非规范或回环监听地址。");
+  }
+  if (r.key !== linuxFirewallKey(r)) linuxFirewallFail("blocked", "防火墙规则标识校验失败。");
+  return { key: r.key, protocol: r.protocol, port: r.port, family: r.family, destination: r.destination };
+}
+function linuxFirewallValidatePlan(plan: FirewallPlan): void {
+  if (!/^[0-9a-f]{20}$/.test(plan.scope) || !/^[0-9a-f]{64}$/.test(plan.fingerprint) || !Array.isArray(plan.rules) || plan.rules.length > 128) linuxFirewallFail("blocked", "防火墙计划格式不合法。");
+  const keys = plan.rules.map(rule => linuxFirewallValidateRule(rule).key);
+  if (new Set(keys).size !== keys.length) linuxFirewallFail("blocked", "防火墙计划含重复规则。");
+}
+async function linuxFirewallRun(s: LinuxFirewallSession, executable: string, args: string[]): Promise<LinuxFirewallReply> {
+  try { return await s.runner(executable, args, { timeoutMs: 20000, env: { LC_ALL: "C", LANG: "C" } }); }
+  catch (error) {
+    const e = error as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return { code: 127, stdout: "", stderr: `${executable}: command not found` };
+    if (e.code === "EACCES" || e.code === "EPERM") linuxFirewallFail("permission-required", `查询或设置 ${executable} 需要管理员权限。`);
+    throw error;
+  }
+}
+function linuxFirewallSuccess(r: LinuxFirewallReply, operation: string): string {
+  if (r.code !== 0) {
+    const detail = (r.stderr.trim() || r.stdout.trim() || `退出码 ${r.code}`).slice(0, 1500);
+    linuxFirewallFail(linuxFirewallPermissionPattern.test(detail) ? "permission-required" : "error", `${operation}失败：${detail}`);
+  }
+  return r.stdout.trim();
+}
+async function linuxFirewallMutation(s: LinuxFirewallSession, executable: string, args: string[]): Promise<void> {
+  if (s.plan.rules.length && s.journal && s.journal.backend !== s.backend) {
+    s.journal.backend = s.backend as Exclude<LinuxFirewallBackend, "none">;
+    linuxFirewallWriteJournal(s.context, s.journal);
+  }
+  // A command may partially succeed before returning an error. Do not claim an unchanged firewall afterwards.
+  s.changed = true;
+  linuxFirewallSuccess(await linuxFirewallRun(s, executable, args), `更新 ${executable} 规则`);
+}
+function linuxFirewallResult(s: LinuxFirewallSession, status: FirewallResult["status"], detail: string): FirewallResult {
+  return { backend: s.backend, status, changed: s.changed, detail, warnings: [...new Set([...s.warnings, ...s.plan.warnings])], rules: s.plan.rules };
+}
+/** Read argv-like diagnostic output only. Never execute the parsed text or interpolate it into a shell. */
+function linuxFirewallWords(text: string): string[] {
+  const result: string[] = []; let word = "", quote = "", started = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (quote) {
+      if (c === quote) quote = "";
+      else if (c === "\\" && quote === '"') { if (++i >= text.length) linuxFirewallFail("blocked", "无法安全解析防火墙规则。"); word += text[i]!; }
+      else word += c;
+    } else if (c === "'" || c === '"') { quote = c; started = true; }
+    else if (c === "\\") { if (++i >= text.length) linuxFirewallFail("blocked", "无法安全解析防火墙规则。"); word += text[i]!; started = true; }
+    else if (/\s/.test(c)) { if (started) result.push(word); word = ""; started = false; }
+    else { word += c; started = true; }
+  }
+  if (quote) linuxFirewallFail("blocked", "防火墙规则含未闭合的引号。");
+  if (started) result.push(word);
+  return result;
+}
+function linuxFirewallSameWords(a: string[], b: string[]): boolean { return a.length === b.length && a.every((v, i) => v === b[i]); }
+function linuxFirewallNormalizeAddress(address: string, family: 4 | 6): string {
+  if (address === "any" || address === "Anywhere" || address === (family === 4 ? "0.0.0.0/0" : "::/0")) return family === 4 ? "0.0.0.0/0" : "::/0";
+  const plain = address.replace(family === 4 ? /\/32$/ : /\/128$/, "");
+  if (linuxFirewallNet.isIP(plain) !== family) return "";
+  return family === 6 ? new URL(`http://[${plain}]/`).hostname.slice(1, -1) : plain;
+}
+
+async function linuxFirewallDetect(s: LinuxFirewallSession, options: FirewallOptions): Promise<{ backend: LinuxFirewallBackend; active: boolean }> {
+  const probes = await Promise.all([
+    linuxFirewallRun(s, "ufw", ["status"]), linuxFirewallRun(s, "firewall-cmd", ["--state"]),
+  ]);
+  const ufw = probes[0]!, firewalld = probes[1]!;
+  for (const [name, reply] of [["UFW", ufw], ["firewalld", firewalld]] as const) {
+    if (reply.code !== 0 && linuxFirewallPermissionPattern.test(`${reply.stderr}\n${reply.stdout}`)) linuxFirewallFail("permission-required", `需要管理员权限才能确认 ${name} 的状态。`);
+  }
+  const ufwActive = ufw.code === 0 && /^Status:\s*active\s*$/mi.test(ufw.stdout);
+  const firewalldActive = firewalld.code === 0 && /^running\s*$/mi.test(firewalld.stdout);
+  const ufwKnown = ufw.code === 127 || ufwActive || (ufw.code === 0 && /^Status:\s*inactive\s*$/mi.test(ufw.stdout));
+  const firewalldKnown = firewalld.code === 127 || firewalldActive || /not running|NOT_RUNNING/i.test(firewalld.stderr + firewalld.stdout);
+  if (!ufwKnown || !firewalldKnown) linuxFirewallFail("blocked", "无法确认现有防火墙管理器状态；请先检查 ufw status / firewall-cmd --state，避免混用防火墙。");
+  if (ufwActive && firewalldActive) linuxFirewallFail("blocked", "UFW 和 firewalld 同时运行。请先确定由哪个工具管理防火墙。");
+  if (options.linuxBackend !== "auto") {
+    if ((ufwActive && options.linuxBackend !== "ufw") || (firewalldActive && options.linuxBackend !== "firewalld")) linuxFirewallFail("blocked", "指定后端与正在运行的防火墙管理器不同，请在高级设置中选择当前管理器。");
+    if (options.linuxBackend === "ufw") return { backend: "ufw", active: ufwActive };
+    if (options.linuxBackend === "firewalld") return { backend: "firewalld", active: firewalldActive };
+    return { backend: "iptables", active: true };
+  }
+  if (ufwActive) return { backend: "ufw", active: true };
+  if (firewalldActive) return { backend: "firewalld", active: true };
+  return { backend: "iptables", active: true };
+}
+
+interface LinuxUfwEntry { rule: FirewallRule; comment: string; action: string; anySource: boolean; raw: string }
+function linuxUfwComment(scope: string, rule: FirewallRule): string { return `NexusEdge:${scope}:${rule.family}:${rule.protocol}:${rule.port}:${rule.destination}`; }
+function linuxUfwSpec(scope: string, rule: FirewallRule): string[] {
+  return ["allow", "in", "proto", rule.protocol, "from", rule.family === 4 ? "0.0.0.0/0" : "::/0", "to", rule.destination, "port", String(rule.port), "comment", linuxUfwComment(scope, rule)];
+}
+function linuxUfwParseStatus(text: string, scope: string): LinuxUfwEntry[] {
+  const entries: LinuxUfwEntry[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const marker = `NexusEdge:${scope}:`;
+    const match = /^\s*(?:\[\s*\d+\]\s*)?(.+?)\s+(ALLOW|DENY|REJECT|LIMIT)\s+(IN|OUT|FWD)\s+(.+?)(?:\s+#\s*(.*))?\s*$/.exec(raw);
+    if (!match) { if (raw.includes(marker)) linuxFirewallFail("blocked", "无法识别带本安装标记的 UFW 规则，已停止自动修改。"); continue; }
+    const comment = match[5] || "", family: 4 | 6 = /\(v6\)/.test(match[1]! + match[4]!) ? 6 : 4;
+    const destinationText = match[1]!.replace(/\s*\(v6\)/g, "").trim();
+    const sourceText = match[4]!.replace(/\s*\(v6\)/g, "").trim();
+    // UFW status renders a concrete destination as '<address> <port>/<protocol>'.
+    const tokens = destinationText.split(/\s+/), portToken = tokens.find(token => /^\d+\/(tcp|udp)$/.test(token));
+    let destination = "";
+    if (portToken && tokens.length <= 2) destination = linuxFirewallNormalizeAddress(tokens.find(t => t !== portToken) || "Anywhere", family);
+    if (!portToken || !destination || match[3] !== "IN") {
+      if (comment.startsWith(marker)) linuxFirewallFail("blocked", "本安装的 UFW 标记出现在无法安全管理的规则上。");
+      continue;
+    }
+    const [port, protocol] = portToken.split("/");
+    const base = { protocol: protocol as "tcp" | "udp", port: Number(port), family, destination };
+    const rule = linuxFirewallValidateRule({ ...base, key: linuxFirewallKey(base) });
+    const entry = { rule, action: match[2]!, comment, anySource: linuxFirewallNormalizeAddress(sourceText, family) === (family === 4 ? "0.0.0.0/0" : "::/0"), raw };
+    if (comment.startsWith(marker) && (entry.action !== "ALLOW" || !entry.anySource || comment !== linuxUfwComment(scope, rule))) linuxFirewallFail("blocked", "本安装的 UFW 规则标记与规则内容不一致；不会删除或接管该规则。");
+    entries.push(entry);
+  }
+  return entries;
+}
+async function linuxUfwSnapshot(s: LinuxFirewallSession): Promise<LinuxUfwEntry[]> {
+  const status = linuxFirewallSuccess(await linuxFirewallRun(s, "ufw", ["status", "numbered"]), "读取 UFW 规则");
+  if (!/^Status:\s*active\s*$/mi.test(status)) linuxFirewallFail("inactive", "UFW 未启用；工具不会自动启用防火墙。已有规则将在 UFW 启用后生效。");
+  s.ufwStatus = status;
+  return linuxUfwParseStatus(status, s.plan.scope);
+}
+function linuxUfwCovers(entry: LinuxUfwEntry, rule: FirewallRule): boolean {
+  return entry.action === "ALLOW" && entry.anySource && entry.rule.protocol === rule.protocol && entry.rule.port === rule.port && entry.rule.family === rule.family && (entry.rule.destination === rule.destination || entry.rule.destination === (rule.family === 4 ? "0.0.0.0/0" : "::/0"));
+}
+function linuxUfwCheckOrdering(s: LinuxFirewallSession, entries: LinuxUfwEntry[]): void {
+  const lines = (s.ufwStatus || "").split(/\r?\n/);
+  for (const rule of s.plan.rules) {
+    const firstAllow = entries.find(entry => linuxUfwCovers(entry, rule));
+    if (!firstAllow) continue;
+    for (const line of lines.slice(0, lines.indexOf(firstAllow.raw))) {
+      const denied = /^\s*(?:\[\s*\d+\]\s*)?(.+?)\s+(?:DENY|REJECT|LIMIT)\s+IN\s+(.+?)(?:\s+#.*)?\s*$/.exec(line);
+      if (!denied) continue;
+      const family = /\(v6\)/.test(denied[1]! + denied[2]!) || denied[1]!.split(/\s+/).some(t => linuxFirewallNet.isIP(t.split("/")[0]!) === 6) ? 6 : 4;
+      if (family !== rule.family) continue;
+      const tokens = denied[1]!.replace(/\s*\(v6\)/g, "").trim().split(/\s+/);
+      const portToken = tokens.find(t => /^\d+(?::\d+)?(?:,\d+(?::\d+)?)*(?:\/(?:tcp|udp))?$/.test(t));
+      if (portToken) {
+        const [ports, protocol] = portToken.split("/");
+        if (protocol && protocol !== rule.protocol) continue;
+        if (!ports!.split(",").some(part => { const [first, last] = part.split(":").map(Number); return rule.port >= first! && rule.port <= (last ?? first!); })) continue;
+      }
+      const anyProtocol = tokens.find(t => /^Anywhere\/(tcp|udp)$/.test(t));
+      if (anyProtocol && anyProtocol !== `Anywhere/${rule.protocol}`) continue;
+      const address = tokens.find(t => linuxFirewallNet.isIP(t.replace(/\/(32|128)$/, "")) !== 0);
+      if (address && !rule.destination.endsWith("/0") && linuxFirewallNormalizeAddress(address, rule.family) !== rule.destination) continue;
+      const source = denied[2]!.replace(/\s*\(v6\)/g, "").replace(/\s*\(log(?:-all)?\)\s*$/, "").replace(/\/(tcp|udp)$/, "").trim();
+      const unrestrictedSource = linuxFirewallNormalizeAddress(source, rule.family) === (rule.family === 4 ? "0.0.0.0/0" : "::/0");
+      const remaining = tokens.filter(t => t !== portToken && t !== address && !/^Anywhere(?:\/(tcp|udp))?$/.test(t));
+      if (!unrestrictedSource || remaining.length || (address && rule.destination.endsWith("/0"))) {
+        const warning = `UFW 在 ${rule.port}/${rule.protocol} 放行前还有来源、网卡或范围限制规则；它们可能限制部分客户端，工具保留这些限制。`;
+        if (!s.warnings.includes(warning)) s.warnings.push(warning);
+        continue;
+      }
+      linuxFirewallFail("blocked", `UFW 的 ${rule.port}/${rule.protocol} 放行规则之前存在拒绝或限制规则；请检查 ufw status numbered 的顺序，工具不会接管已有手动规则。`);
+    }
+  }
+}
+async function linuxUfwCheckRuntime(s: LinuxFirewallSession, entries: LinuxUfwEntry[]): Promise<void> {
+  for (const rule of s.plan.rules) {
+    const covering = entries.find(entry => linuxUfwCovers(entry, rule));
+    if (!covering) continue;
+    const r = covering.rule, executable = r.family === 4 ? "iptables" : "ip6tables", chain = r.family === 4 ? "ufw-user-input" : "ufw6-user-input";
+    const reply = await linuxFirewallRun(s, executable, ["-w", "5", "-C", chain, "-p", r.protocol, "-m", r.protocol, "-d", r.destination, "--dport", String(r.port), "-j", "ACCEPT"]);
+    if (reply.code === 1 && !linuxFirewallPermissionPattern.test(reply.stderr + reply.stdout)) linuxFirewallFail("blocked", `UFW 中 ${r.port}/${r.protocol} 的配置与当前内核用户链不一致，不能确认已放行；请检查 UFW 状态和系统防火墙日志。`);
+    linuxFirewallSuccess(reply, `验证 UFW 的 IPv${r.family} 内核端口规则`);
+  }
+}
+async function linuxUfwSync(s: LinuxFirewallSession, apply: boolean): Promise<FirewallResult> {
+  let entries = await linuxUfwSnapshot(s);
+  const own = () => entries.filter(e => e.comment.startsWith(`NexusEdge:${s.plan.scope}:`));
+  const missing = s.plan.rules.filter(rule => !entries.some(entry => linuxUfwCovers(entry, rule)));
+  const stale = own().filter(entry => !s.plan.rules.some(rule => rule.key === entry.rule.key));
+  if (s.plan.rules.some(rule => entries.some(entry => linuxUfwCovers(entry, rule) && /^NexusEdge:[0-9a-f]{20}:/.test(entry.comment) && !entry.comment.startsWith(`NexusEdge:${s.plan.scope}:`)))) linuxFirewallFail("blocked", "另一个 NexusEdge 安装的 UFW 规则覆盖了此端口。UFW 不能并存等价规则；请先明确旧安装的规则归属，再迁移，避免清理旧安装时关闭新节点端口。");
+  // UFW deletion matches the rule body. Duplicate bodies with another comment cannot be removed safely.
+  for (const entry of stale) if (entries.filter(e => e.action === "ALLOW" && e.anySource && e.rule.key === entry.rule.key).length !== 1) linuxFirewallFail("blocked", "UFW 中存在相同内容但不同归属的规则；请手动检查，工具不会按序号删除。");
+  linuxUfwCheckOrdering(s, entries);
+  s.warnings.push("UFW 自定义 before/after 规则和外部网络策略仍可能阻止连接；此状态仅确认 UFW 用户规则。");
+  if (s.plan.rules.some(rule => entries.some(entry => linuxUfwCovers(entry, rule) && !entry.comment.startsWith(`NexusEdge:${s.plan.scope}:`)))) s.warnings.push("已有手动放行规则覆盖部分端口；工具保留其归属，移除本工具规则时不会删除它们。");
+  if (!apply) { await linuxUfwCheckRuntime(s, entries); return linuxFirewallResult(s, missing.length || stale.length ? "needs-update" : "synced", missing.length || stale.length ? "UFW 端口规则需要同步。" : "UFW 端口配置及内核用户规则与当前节点一致。"); }
+  for (const rule of missing) {
+    // prepend deliberately does not replace the comment on an equivalent manual rule (ufw(8)).
+    await linuxFirewallMutation(s, "ufw", ["prepend", ...linuxUfwSpec(s.plan.scope, rule)]);
+    entries = await linuxUfwSnapshot(s);
+    if (!entries.some(e => e.comment === linuxUfwComment(s.plan.scope, rule) && e.rule.key === rule.key)) linuxFirewallFail("blocked", "UFW 未能确认新规则的归属（可能已有等价规则，或 IPv6 未启用）；保留原有规则。");
+  }
+  linuxUfwCheckOrdering(s, entries); await linuxUfwCheckRuntime(s, entries);
+  for (const entry of stale) {
+    entries = await linuxUfwSnapshot(s);
+    const same = entries.filter(e => e.action === "ALLOW" && e.anySource && e.rule.key === entry.rule.key);
+    if (!same.some(e => e.comment === entry.comment)) continue;
+    if (same.length !== 1) linuxFirewallFail("blocked", "UFW 规则在同步期间发生变化，已停止清理旧规则。");
+    await linuxFirewallMutation(s, "ufw", ["--force", "delete", ...linuxUfwSpec(s.plan.scope, entry.rule)]);
+  }
+  entries = await linuxUfwSnapshot(s);
+  if (s.plan.rules.some(rule => !entries.some(entry => linuxUfwCovers(entry, rule))) || own().some(entry => !s.plan.rules.some(rule => rule.key === entry.rule.key))) linuxFirewallFail("error", "UFW 最终校验失败；请检查状态，不能确认全部端口规则已同步。");
+  linuxUfwCheckOrdering(s, entries); await linuxUfwCheckRuntime(s, entries);
+  return linuxFirewallResult(s, "synced", "UFW 已同步并验证当前节点端口配置及内核用户规则，规则会由 UFW 持久保存。");
+}
+
+interface LinuxFirewalldClaim { zone: string; rule: FirewallRule; runtime: boolean; permanent: boolean }
+interface LinuxFirewallJournal { schema: 1; scope: string; backend?: Exclude<LinuxFirewallBackend, "none">; firewalld: LinuxFirewalldClaim[] }
+function linuxFirewalldZoneValid(zone: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(zone); }
+function linuxFirewallCheckStatePath(context: LinuxFirewallContext): void {
+  const parent = linuxFirewallPath.dirname(context.stateFile);
+  if (!linuxFirewallPath.isAbsolute(context.stateFile) || linuxFirewallPath.basename(context.stateFile) !== "firewall-linux-state.json") linuxFirewallFail("blocked", "防火墙状态文件必须位于安装数据目录。");
+  const stat = linuxFirewallFs.lstatSync(parent);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0 || linuxFirewallFs.realpathSync(parent) !== linuxFirewallPath.resolve(parent)) linuxFirewallFail("blocked", "防火墙状态目录不是受保护的真实目录，已停止写入。");
+  try { const old = linuxFirewallFs.lstatSync(context.stateFile); if (!old.isFile() || old.isSymbolicLink() || old.nlink !== 1 || old.size > 512 * 1024) linuxFirewallFail("blocked", "防火墙状态文件类型或大小不合法。"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+function linuxFirewallReadJournal(plan: FirewallPlan, context: LinuxFirewallContext): LinuxFirewallJournal {
+  linuxFirewallCheckStatePath(context);
+  let value: unknown;
+  try {
+    const fd = linuxFirewallFs.openSync(context.stateFile, linuxFirewallFs.constants.O_RDONLY | linuxFirewallFs.constants.O_NOFOLLOW);
+    try { const stat = linuxFirewallFs.fstatSync(fd); if (!stat.isFile() || stat.nlink !== 1 || stat.size > 512 * 1024) linuxFirewallFail("blocked", "防火墙状态文件不合法。"); value = JSON.parse(linuxFirewallFs.readFileSync(fd, "utf8")); }
+    finally { linuxFirewallFs.closeSync(fd); }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schema: 1, scope: plan.scope, firewalld: [] };
+    if (error instanceof SyntaxError) linuxFirewallFail("blocked", "防火墙归属记录已损坏；请先检查状态文件，不能安全清理已有规则。");
+    throw error;
+  }
+  const j = value as LinuxFirewallJournal;
+  if (!j || j.schema !== 1 || j.scope !== plan.scope || (j.backend !== undefined && !["ufw", "firewalld", "iptables"].includes(j.backend)) || !Array.isArray(j.firewalld) || j.firewalld.length > 1024) linuxFirewallFail("blocked", "防火墙归属记录不属于当前安装或格式不合法。");
+  const ids = new Set<string>();
+  for (const claim of j.firewalld) {
+    if (!claim || !linuxFirewalldZoneValid(claim.zone) || typeof claim.runtime !== "boolean" || typeof claim.permanent !== "boolean") linuxFirewallFail("blocked", "防火墙归属记录含非法条目。");
+    claim.rule = linuxFirewallValidateRule(claim.rule);
+    const id = `${claim.zone}/${claim.rule.key}`; if (ids.has(id)) linuxFirewallFail("blocked", "防火墙归属记录含重复条目。"); ids.add(id);
+  }
+  return j;
+}
+function linuxFirewallWriteJournal(context: LinuxFirewallContext, journal: LinuxFirewallJournal): void {
+  linuxFirewallCheckStatePath(context);
+  const temporary = `${context.stateFile}.${process.pid}.${linuxFirewallCrypto.randomBytes(6).toString("hex")}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = linuxFirewallFs.openSync(temporary, "wx", 0o600);
+    linuxFirewallFs.writeFileSync(fd, JSON.stringify(journal, null, 2) + "\n", "utf8");
+    // Only finite ports and ownership metadata; readable after sudo without changing directory ownership.
+    linuxFirewallFs.fchmodSync(fd, 0o644); linuxFirewallFs.fsyncSync(fd); linuxFirewallFs.closeSync(fd); fd = undefined;
+    linuxFirewallCheckStatePath(context); linuxFirewallFs.renameSync(temporary, context.stateFile);
+    const parentFd = linuxFirewallFs.openSync(linuxFirewallPath.dirname(context.stateFile), "r");
+    try { linuxFirewallFs.fsyncSync(parentFd); } finally { linuxFirewallFs.closeSync(parentFd); }
+  } finally {
+    if (fd !== undefined) linuxFirewallFs.closeSync(fd);
+    try { linuxFirewallFs.unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+/** OS-backed SQLite lock: a crash releases the lock, unlike PID files, while the intent journal survives. */
+function linuxFirewallAcquireLocks(contexts: LinuxFirewallContext[]): () => void {
+  const databases: linuxFirewallSqlite.Database[] = [];
+  try {
+    for (const context of [...new Map(contexts.map(c => [c.stateFile, c])).values()].sort((a, b) => a.stateFile.localeCompare(b.stateFile))) {
+      linuxFirewallCheckStatePath(context);
+      const lockFile = context.stateFile.replace(/\.json$/, "-lock.sqlite");
+      try { const stat = linuxFirewallFs.lstatSync(lockFile); if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) linuxFirewallFail("blocked", "防火墙同步锁文件不合法。"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const fd = linuxFirewallFs.openSync(lockFile, "wx", 0o644); linuxFirewallFs.closeSync(fd);
+      }
+      const database = new linuxFirewallSqlite.Database(lockFile, { create: true }); databases.push(database);
+      try { database.exec("PRAGMA busy_timeout = 3000; BEGIN EXCLUSIVE;"); }
+      catch (error) {
+        if (/locked|busy/i.test(String(error))) linuxFirewallFail("blocked", "另一个进程正在同步防火墙，请稍后重试。");
+        if (/readonly|permission/i.test(String(error))) linuxFirewallFail("permission-required", "同步防火墙需要管理员权限才能取得安装目录的同步锁。");
+        throw error;
+      }
+    }
+  } catch (error) { for (const database of databases.reverse()) database.close(); throw error; }
+  return () => { for (const database of databases.reverse()) { try { database.exec("ROLLBACK;"); } finally { database.close(); } } };
+}
+function linuxFirewalldRichRule(scope: string, rule: FirewallRule): string {
+  const priority = -10000 - Number.parseInt(scope.slice(0, 8), 16) % 20000;
+  return `rule family="ipv${rule.family}" priority="${priority}" destination address="${rule.destination}" port port="${rule.port}" protocol="${rule.protocol}" accept`;
+}
+function linuxFirewalldArgs(claim: LinuxFirewalldClaim, permanent: boolean, action: "query" | "add" | "remove", scope: string): string[] {
+  return [...(permanent ? ["--permanent"] : []), `--zone=${claim.zone}`, `--${action}-rich-rule=${linuxFirewalldRichRule(scope, claim.rule)}`];
+}
+async function linuxFirewalldHas(s: LinuxFirewallSession, claim: LinuxFirewalldClaim, permanent: boolean): Promise<boolean> {
+  const r = await linuxFirewallRun(s, "firewall-cmd", linuxFirewalldArgs(claim, permanent, "query", s.plan.scope));
+  if (r.code === 0 && /^yes\s*$/i.test(r.stdout.trim())) return true;
+  if (r.code === 1 && /^no\s*$/i.test(r.stdout.trim())) return false;
+  linuxFirewallSuccess(r, "查询 firewalld 规则");
+  linuxFirewallFail("error", "firewalld 返回了无法确认的查询结果。");
+}
+async function linuxFirewalldSelectZone(s: LinuxFirewallSession, options: FirewallOptions): Promise<string> {
+  const zones = linuxFirewallSuccess(await linuxFirewallRun(s, "firewall-cmd", ["--get-zones"]), "查询 firewalld zones").split(/\s+/).filter(Boolean);
+  let zone = options.firewalldZone;
+  if (!zone) {
+    const active = linuxFirewallSuccess(await linuxFirewallRun(s, "firewall-cmd", ["--get-active-zones"]), "查询活动 firewalld zone").split(/\r?\n/).filter(line => line.trim() && !/^\s/.test(line)).map(line => line.trim().replace(/\s+\(default\)$/, ""));
+    if (active.length > 1) linuxFirewallFail("blocked", `检测到多个活动 zone（${active.join("、")}），请在防火墙高级设置中选择服务器入站网卡对应的 zone。`);
+    zone = active[0] || linuxFirewallSuccess(await linuxFirewallRun(s, "firewall-cmd", ["--get-default-zone"]), "查询默认 firewalld zone");
+  }
+  if (!linuxFirewalldZoneValid(zone) || !zones.includes(zone)) linuxFirewallFail("blocked", "所选 firewalld zone 不存在或名称不合法。");
+  return zone;
+}
+async function linuxFirewalldSync(s: LinuxFirewallSession, options: FirewallOptions, context: LinuxFirewallContext, apply: boolean): Promise<FirewallResult> {
+  const journal = s.journal!;
+  const zone = s.plan.rules.length ? await linuxFirewalldSelectZone(s, options) : "";
+  const desired = s.plan.rules.map(rule => ({ zone, rule, runtime: false, permanent: false }));
+  const pending: { claim: LinuxFirewalldClaim; permanent: boolean }[] = [];
+  const stale = journal.firewalld.filter(claim => !desired.some(d => d.zone === claim.zone && d.rule.key === claim.rule.key));
+  // Read every prospective rule before writing anything. An equal priority does not establish ownership.
+  for (const wanted of desired) {
+    const claim = journal.firewalld.find(c => c.zone === wanted.zone && c.rule.key === wanted.rule.key) || wanted;
+    for (const permanent of [false, true]) {
+      const key = permanent ? "permanent" : "runtime";
+      const exists = await linuxFirewalldHas(s, claim, permanent);
+      if (exists && !claim[key]) linuxFirewallFail("blocked", `firewalld 的 ${claim.zone} zone 已有相同优先级和内容的${permanent ? "永久" : "运行时"}规则，但不属于本安装；不会接管它。`);
+      if (!exists) pending.push({ claim, permanent });
+    }
+  }
+  s.warnings.push("firewalld 仅同步所选 zone 的规则；其他 zone、策略对象或云安全组仍需按实际入站路径检查。");
+  if (!apply) return linuxFirewallResult(s, pending.length || stale.length ? "needs-update" : "synced", pending.length || stale.length ? "firewalld 端口规则需要同步。" : "firewalld 运行时和永久端口规则均已验证。");
+  for (const addition of pending) {
+    const { claim, permanent } = addition, key = permanent ? "permanent" : "runtime";
+    // Recheck the absence immediately before recording intent, and record before the OS mutation.
+    if (await linuxFirewalldHas(s, claim, permanent)) linuxFirewallFail("blocked", "firewalld 规则在同步期间发生变化，已停止修改。");
+    if (!journal.firewalld.includes(claim)) journal.firewalld.push(claim);
+    claim[key] = true; linuxFirewallWriteJournal(context, journal);
+    await linuxFirewallMutation(s, "firewall-cmd", linuxFirewalldArgs(claim, permanent, "add", s.plan.scope));
+    if (!await linuxFirewalldHas(s, claim, permanent)) linuxFirewallFail("error", "firewalld 新规则校验失败，尚未清理旧规则。");
+  }
+  // All new runtime and persistent rules have been verified before pruning any old port/zone.
+  for (const claim of stale) {
+    for (const permanent of [false, true]) {
+      const key = permanent ? "permanent" : "runtime";
+      if (!claim[key]) continue;
+      if (await linuxFirewalldHas(s, claim, permanent)) await linuxFirewallMutation(s, "firewall-cmd", linuxFirewalldArgs(claim, permanent, "remove", s.plan.scope));
+      if (await linuxFirewalldHas(s, claim, permanent)) linuxFirewallFail("error", "firewalld 旧规则仍然存在，清理未完成。");
+      claim[key] = false; linuxFirewallWriteJournal(context, journal);
+    }
+    journal.firewalld = journal.firewalld.filter(c => c !== claim); linuxFirewallWriteJournal(context, journal);
+  }
+  for (const wanted of desired) for (const permanent of [false, true]) if (!await linuxFirewalldHas(s, wanted, permanent)) linuxFirewallFail("error", "firewalld 最终校验失败，不能确认全部端口规则已同步。");
+  return linuxFirewallResult(s, "synced", zone ? `firewalld 已同步 ${zone} zone 的运行时及永久端口规则，无需 reload。` : "已移除本安装创建的 firewalld 端口规则。");
+}
+
+interface LinuxIptablesSnapshot { family: 4 | 6; executable: string; available: boolean; lines: string[][]; owned: FirewallRule[]; chainExists: boolean; jumpExists: boolean; active: boolean }
+function linuxIptablesChain(scope: string): string { return `NXE_${scope}`; }
+function linuxIptablesOwner(scope: string): string[] { return ["-m", "comment", "--comment", `NexusEdge:${scope}:owner`, "-j", "RETURN"]; }
+function linuxIptablesJump(scope: string): string[] { return ["-m", "comment", "--comment", `NexusEdge:${scope}:jump`, "-j", linuxIptablesChain(scope)]; }
+function linuxIptablesRule(scope: string, rule: FirewallRule): string[] {
+  return ["-d", rule.destination, "-p", rule.protocol, "-m", rule.protocol, "--dport", String(rule.port), "-m", "comment", "--comment", `NexusEdge:${scope}:${rule.key}`, "-j", "ACCEPT"];
+}
+function linuxIptablesParseRule(words: string[], scope: string, family: 4 | 6): FirewallRule | undefined {
+  let destination = family === 4 ? "0.0.0.0/0" : "::/0", protocol = "", port = "", comment = "", target = "";
+  const modules: string[] = [], seen = new Set<string>();
+  for (let i = 0; i < words.length; i += 2) {
+    const flag = words[i]!, value = words[i + 1]; if (value === undefined) return;
+    if (flag !== "-m" && seen.has(flag)) return; seen.add(flag);
+    if (flag === "-d") destination = linuxFirewallNormalizeAddress(value, family);
+    else if (flag === "-p") protocol = value;
+    else if (flag === "--dport") port = value;
+    else if (flag === "--comment") comment = value;
+    else if (flag === "-j") target = value;
+    else if (flag === "-m") modules.push(value);
+    else return;
+  }
+  if (!destination || !["tcp", "udp"].includes(protocol) || !/^\d+$/.test(port) || target !== "ACCEPT" || modules.length !== 2 || !modules.includes("comment") || !modules.includes(protocol)) return;
+  const base = { protocol: protocol as "tcp" | "udp", port: Number(port), family, destination };
+  const rule = { ...base, key: linuxFirewallKey(base) };
+  if (comment !== `NexusEdge:${scope}:${rule.key}`) return;
+  return linuxFirewallValidateRule(rule);
+}
+async function linuxIptablesSnapshot(s: LinuxFirewallSession, family: 4 | 6): Promise<LinuxIptablesSnapshot> {
+  const executable = family === 4 ? "iptables" : "ip6tables", chain = linuxIptablesChain(s.plan.scope);
+  const reply = await linuxFirewallRun(s, executable, ["-w", "5", "-S"]);
+  if (reply.code === 127) return { family, executable, available: false, lines: [], owned: [], chainExists: false, jumpExists: false, active: false };
+  if (family === 6 && reply.code !== 0 && /address family not supported|protocol not supported/i.test(reply.stderr)) return { family, executable, available: false, lines: [], owned: [], chainExists: false, jumpExists: false, active: false };
+  const text = linuxFirewallSuccess(reply, `读取 ${executable} filter 表`);
+  if (/incompatible|use .?nft/i.test(reply.stderr)) linuxFirewallFail("unsupported", `${executable} 无法完整读取现有规则；请使用当前系统防火墙管理工具手动放行。`);
+  const lines = text.split(/\r?\n/).filter(line => line.trim() && !line.startsWith("#")).map(linuxFirewallWords);
+  if (!lines.some(line => line[0] === "-P" && line[1] === "INPUT")) linuxFirewallFail("blocked", `${executable} 返回了无法识别的 INPUT 链。`);
+  const chainExists = lines.some(line => linuxFirewallSameWords(line, ["-N", chain]));
+  const chainRules = lines.filter(line => line[0] === "-A" && line[1] === chain).map(line => line.slice(2));
+  const ownMarker = linuxIptablesOwner(s.plan.scope);
+  const ownerCount = chainRules.filter(line => linuxFirewallSameWords(line, ownMarker)).length;
+  if (chainExists && (ownerCount !== 1 || !linuxFirewallSameWords(chainRules[chainRules.length - 1] || [], ownMarker))) linuxFirewallFail("blocked", `${executable} 的 ${chain} 链没有完整的本安装标记，不会接管或清空它。`);
+  const owned: FirewallRule[] = [];
+  for (const words of chainRules) {
+    if (linuxFirewallSameWords(words, ownMarker)) continue;
+    const rule = linuxIptablesParseRule(words, s.plan.scope, family);
+    if (!rule) linuxFirewallFail("blocked", `${executable} 的本安装链包含其他规则，不会修改。`);
+    if (owned.some(r => r.key === rule.key)) linuxFirewallFail("blocked", `${executable} 的本安装链包含重复规则，请先手动检查。`);
+    owned.push(rule);
+  }
+  const references = lines.filter(line => line[0] === "-A" && line.some((word, i) => (word === "-j" || word === "-g") && line[i + 1] === chain));
+  if (references.length > 1 || references.some(line => line[1] !== "INPUT" || !linuxFirewallSameWords(line.slice(2), linuxIptablesJump(s.plan.scope)))) linuxFirewallFail("blocked", `${executable} 存在其他规则引用本安装链，已停止自动修改。`);
+  const jumpExists = references.length === 1;
+  const inputRules = lines.filter(line => line[0] === "-A" && line[1] === "INPUT");
+  if (jumpExists && s.plan.rules.some(rule => rule.family === family) && inputRules[0] !== references[0]) linuxFirewallFail("blocked", `${executable} 的本安装入口前出现了其他 INPUT 规则；请检查顺序，避免错误报告端口已放行。`);
+  const active = lines.some(line => line[0] === "-P" && line[1] === "INPUT" && line[2] !== "ACCEPT") || inputRules.length > 0 || chainExists;
+  return { family, executable, available: true, lines, owned, chainExists, jumpExists, active };
+}
+async function linuxIptablesCheckNft(s: LinuxFirewallSession): Promise<void> {
+  const [nft, version4, version6] = await Promise.all([linuxFirewallRun(s, "nft", ["-j", "list", "ruleset"]), linuxFirewallRun(s, "iptables", ["--version"]), linuxFirewallRun(s, "ip6tables", ["--version"])]);
+  for (const version of [version4, version6]) if (version.code !== 127) linuxFirewallSuccess(version, "查询 iptables 后端");
+  if (nft.code === 127) {
+    if (version4.code === 127 && version6.code === 127) return;
+    linuxFirewallFail("unsupported", "无法检查原生 nftables 策略（nft 命令不可用）。请安装 nft 以完成只读检测，或手动放行端口。");
+  }
+  const raw = linuxFirewallSuccess(nft, "检查 nftables input 链");
+  let data: { nftables?: { chain?: { family?: string; table?: string; name?: string; hook?: string; type?: string; prio?: number | string } }[] };
+  try { data = JSON.parse(raw); } catch { linuxFirewallFail("blocked", "无法解析 nftables 规则集，已停止自动放行。"); }
+  if (!Array.isArray(data.nftables)) linuxFirewallFail("blocked", "nftables 规则集格式无法确认。");
+  const conflicts = data.nftables.flatMap(entry => {
+    const c = entry.chain;
+    if (!c || c.hook !== "input") return [];
+    const version = c.family === "ip" ? version4 : c.family === "ip6" ? version6 : undefined;
+    if (version?.code === 0 && /nf_tables/.test(version.stdout) && c.table === "filter" && c.name === "INPUT" && c.type === "filter" && [0, "filter"].includes(c.prio!)) return [];
+    return [`${c.family}/${c.table}/${c.name}`];
+  });
+  if (conflicts.length) linuxFirewallFail("unsupported", `检测到原生 nftables input 链（${conflicts.join("、")}）。独立 iptables ACCEPT 无法保证绕过其 DROP 策略，请在现有 nftables 管理配置中放行这些端口。`);
+}
+async function linuxIptablesSync(s: LinuxFirewallSession, apply: boolean): Promise<FirewallResult> {
+  await linuxIptablesCheckNft(s);
+  let snapshots = await Promise.all(([4, 6] as const).map(family => linuxIptablesSnapshot(s, family)));
+  for (const rule of s.plan.rules) if (!snapshots.find(snapshot => snapshot.family === rule.family)?.available) linuxFirewallFail("unsupported", `当前系统缺少 ${rule.family === 4 ? "iptables" : "ip6tables"}，无法自动处理所需的 IPv${rule.family} 端口。`);
+  if (!snapshots.some(snapshot => snapshot.available)) return linuxFirewallResult(s, "inactive", "未检测到正在管理本机端口的 UFW、firewalld 或可用的 iptables；未创建防火墙策略。");
+  if (!snapshots.some(snapshot => snapshot.active)) return linuxFirewallResult(s, "inactive", "iptables INPUT 当前未设置过滤规则且默认允许入站，无需额外放行；工具不会替您启用防火墙。");
+  s.warnings.push("iptables 规则仅在当前内核运行期生效；本工具以管理员权限启动时会重新同步。不会保存或覆盖系统的整个规则集。");
+  s.warnings.push("此状态验证本机 filter/INPUT 规则；其他内核过滤路径、路由和云安全组仍可能影响连通性。");
+  const changed = snapshots.some(snapshot => {
+    const desired = s.plan.rules.filter(rule => rule.family === snapshot.family);
+    return desired.some(rule => !snapshot.owned.some(owned => owned.key === rule.key)) || snapshot.owned.some(rule => !desired.some(wanted => wanted.key === rule.key)) || (desired.length > 0 && !snapshot.jumpExists) || (desired.length === 0 && snapshot.chainExists);
+  });
+  if (!apply) return linuxFirewallResult(s, changed ? "needs-update" : "synced", changed ? "iptables 端口规则需要同步。" : "iptables 本安装端口规则已验证。");
+  // Create all ports in both address families before any stale port is deleted.
+  for (const snapshot of snapshots) {
+    const desired = s.plan.rules.filter(rule => rule.family === snapshot.family);
+    if (!desired.length) continue;
+    const chain = linuxIptablesChain(s.plan.scope), base = ["-w", "5"];
+    if (!snapshot.chainExists) {
+      await linuxFirewallMutation(s, snapshot.executable, [...base, "-N", chain]);
+      await linuxFirewallMutation(s, snapshot.executable, [...base, "-A", chain, ...linuxIptablesOwner(s.plan.scope)]);
+    }
+    for (const rule of desired) if (!snapshot.owned.some(owned => owned.key === rule.key)) await linuxFirewallMutation(s, snapshot.executable, [...base, "-I", chain, "1", ...linuxIptablesRule(s.plan.scope, rule)]);
+    if (!snapshot.jumpExists) await linuxFirewallMutation(s, snapshot.executable, [...base, "-I", "INPUT", "1", ...linuxIptablesJump(s.plan.scope)]);
+  }
+  snapshots = await Promise.all(([4, 6] as const).map(family => linuxIptablesSnapshot(s, family)));
+  for (const rule of s.plan.rules) if (!snapshots.some(snapshot => snapshot.family === rule.family && snapshot.jumpExists && snapshot.owned.some(owned => owned.key === rule.key))) linuxFirewallFail("error", "iptables 新规则校验失败，保留旧端口规则。");
+  for (const snapshot of snapshots) {
+    if (!snapshot.available || !snapshot.chainExists) continue;
+    const desired = s.plan.rules.filter(rule => rule.family === snapshot.family), chain = linuxIptablesChain(s.plan.scope), base = ["-w", "5"];
+    for (const rule of snapshot.owned) if (!desired.some(wanted => wanted.key === rule.key)) await linuxFirewallMutation(s, snapshot.executable, [...base, "-D", chain, ...linuxIptablesRule(s.plan.scope, rule)]);
+    if (!desired.length) {
+      if (snapshot.jumpExists) await linuxFirewallMutation(s, snapshot.executable, [...base, "-D", "INPUT", ...linuxIptablesJump(s.plan.scope)]);
+      await linuxFirewallMutation(s, snapshot.executable, [...base, "-D", chain, ...linuxIptablesOwner(s.plan.scope)]);
+      await linuxFirewallMutation(s, snapshot.executable, [...base, "-X", chain]);
+    }
+  }
+  snapshots = await Promise.all(([4, 6] as const).map(family => linuxIptablesSnapshot(s, family)));
+  for (const snapshot of snapshots) {
+    const desired = s.plan.rules.filter(rule => rule.family === snapshot.family);
+    if (desired.some(rule => !snapshot.jumpExists || !snapshot.owned.some(owned => owned.key === rule.key)) || snapshot.owned.some(rule => !desired.some(wanted => wanted.key === rule.key)) || (!desired.length && snapshot.chainExists)) linuxFirewallFail("error", "iptables 最终规则校验失败，部分规则可能尚未同步。");
+  }
+  return linuxFirewallResult(s, "synced", "iptables 已同步并验证本安装的 IPv4 / IPv6 端口规则。");
+}
+
+async function linuxFirewallOperate(plan: FirewallPlan, options: FirewallOptions, runner: FirewallCommandRunner, context: LinuxFirewallContext, apply: boolean): Promise<FirewallResult> {
+  const s: LinuxFirewallSession = { plan, runner, backend: "none", changed: false, warnings: [], context };
+  let release: (() => void) | undefined;
+  try {
+    linuxFirewallValidatePlan(plan);
+    if (!["auto", "ufw", "firewalld", "iptables"].includes(options.linuxBackend) || typeof options.firewalldZone !== "string") linuxFirewallFail("blocked", "Linux 防火墙设置格式不合法。");
+    const detected = await linuxFirewallDetect(s, options); s.backend = detected.backend;
+    if (!detected.active) return linuxFirewallResult(s, "inactive", plan.rules.length ? `${detected.backend} 未运行；工具不会自动开启防火墙，也未修改已有策略。` : `${detected.backend} 未运行；已有持久规则仍保留。请恢复原防火墙后端后重试移除本工具规则。`);
+    if (apply) release = linuxFirewallAcquireLocks([context]);
+    s.journal = linuxFirewallReadJournal(plan, context);
+    if (s.journal.backend && s.journal.backend !== s.backend) linuxFirewallFail("blocked", `本安装仍记录由 ${s.journal.backend} 管理的规则。请恢复旧后端设置并使用“移除本工具规则”，然后再切换；不要同时启用两个管理器。`);
+    if (s.backend !== "firewalld" && s.journal.firewalld.some(claim => claim.runtime || claim.permanent)) linuxFirewallFail("blocked", "本安装尚有 firewalld 规则记录，请先使用 firewalld 清理或确认旧规则，不能直接混用其他后端。");
+    const result = s.backend === "ufw" ? await linuxUfwSync(s, apply) : s.backend === "firewalld" ? await linuxFirewalldSync(s, options, context, apply) : await linuxIptablesSync(s, apply);
+    if (apply && plan.rules.length && result.status === "synced" && !s.journal.backend) { s.journal.backend = s.backend as Exclude<LinuxFirewallBackend, "none">; linuxFirewallWriteJournal(context, s.journal); }
+    if (apply && !plan.rules.length && result.status === "synced" && s.journal.backend) { delete s.journal.backend; linuxFirewallWriteJournal(context, s.journal); }
+    return result;
+  } catch (error) {
+    if (error instanceof LinuxFirewallFailure) return linuxFirewallResult(s, error.status, error.message);
+    const e = error as NodeJS.ErrnoException;
+    return linuxFirewallResult(s, e.code === "EACCES" || e.code === "EPERM" ? "permission-required" : "error", `Linux 防火墙操作未完成：${e.message || String(error)}`);
+  } finally { release?.(); }
+}
+export async function inspectLinuxFirewall(plan: FirewallPlan, options: FirewallOptions, runner: FirewallCommandRunner, context: LinuxFirewallContext): Promise<FirewallResult> {
+  return linuxFirewallOperate(plan, options, runner, context, false);
+}
+export async function applyLinuxFirewall(plan: FirewallPlan, options: FirewallOptions, runner: FirewallCommandRunner, context: LinuxFirewallContext): Promise<FirewallResult> {
+  return linuxFirewallOperate(plan, options, runner, context, true);
+}
+
+export interface LinuxUfwOwnershipTransfer { result: FirewallResult; rollback: () => Promise<FirewallResult> }
+/** Explicit source-to-system migration only. Ordinary sync never changes another installation's comment. */
+export async function transferLinuxUfwOwnership(sourcePlan: FirewallPlan, targetPlan: FirewallPlan, runner: FirewallCommandRunner, sourceContext: LinuxFirewallContext, targetContext: LinuxFirewallContext): Promise<LinuxUfwOwnershipTransfer> {
+  const source: LinuxFirewallSession = { plan: sourcePlan, runner, backend: "ufw", changed: false, warnings: [], context: sourceContext };
+  const target: LinuxFirewallSession = { plan: targetPlan, runner, backend: "ufw", changed: false, warnings: [], context: targetContext };
+  const attempted: FirewallRule[] = [];
+  const failure = (s: LinuxFirewallSession, error: unknown) => error instanceof LinuxFirewallFailure ? linuxFirewallResult(s, error.status, error.message) : linuxFirewallResult(s, /permission|EACCES|EPERM/i.test(String(error)) ? "permission-required" : "error", `UFW 规则归属迁移未完成：${String(error)}`);
+  const rollback = async (): Promise<FirewallResult> => {
+    if (!attempted.length) return linuxFirewallResult(source, "synced", "没有需要恢复归属的 UFW 规则。");
+    let release: (() => void) | undefined;
+    try {
+      release = linuxFirewallAcquireLocks([sourceContext, targetContext]);
+      source.journal = linuxFirewallReadJournal(sourcePlan, sourceContext);
+      linuxFirewallReadJournal(targetPlan, targetContext);
+      for (const rule of [...attempted].reverse()) {
+        const entries = await linuxUfwSnapshot(target);
+        const same = entries.filter(e => e.action === "ALLOW" && e.anySource && e.rule.key === rule.key);
+        if (same.length === 1 && same[0]!.comment === linuxUfwComment(sourcePlan.scope, rule)) continue;
+        if (same.length !== 1 || same[0]!.comment !== linuxUfwComment(targetPlan.scope, rule)) linuxFirewallFail("blocked", "迁移后的 UFW 规则已由其他操作更改，不能安全恢复归属，请检查该端口。");
+        await linuxFirewallMutation(source, "ufw", linuxUfwSpec(sourcePlan.scope, rule));
+        if (!(await linuxUfwSnapshot(source)).some(e => e.comment === linuxUfwComment(sourcePlan.scope, rule) && e.rule.key === rule.key)) linuxFirewallFail("error", "UFW 原归属恢复校验失败。");
+      }
+      attempted.length = 0;
+      return linuxFirewallResult(source, "synced", "UFW 规则归属已恢复到原安装；放行的地址和端口未改变。");
+    } catch (error) { return failure(source, error); }
+    finally { release?.(); }
+  };
+  let release: (() => void) | undefined;
+  try {
+    linuxFirewallValidatePlan(sourcePlan); linuxFirewallValidatePlan(targetPlan);
+    if (sourcePlan.rules.length !== targetPlan.rules.length || sourcePlan.rules.some(rule => !targetPlan.rules.some(r => r.key === rule.key))) linuxFirewallFail("blocked", "UFW 归属迁移要求源安装和目标安装的监听端口计划完全一致。");
+    if (sourcePlan.scope === targetPlan.scope) return { result: linuxFirewallResult(target, "synced", "安装归属相同，无需迁移 UFW 规则。"), rollback };
+    const detected = await linuxFirewallDetect(source, { linuxBackend: "auto", firewalldZone: "" });
+    if (detected.backend !== "ufw") { target.backend = detected.backend; return { result: linuxFirewallResult(target, "synced", "当前后端无需 UFW 归属迁移。"), rollback }; }
+    release = linuxFirewallAcquireLocks([sourceContext, targetContext]);
+    source.journal = linuxFirewallReadJournal(sourcePlan, sourceContext); target.journal = linuxFirewallReadJournal(targetPlan, targetContext);
+    for (const journal of [source.journal, target.journal]) if ((journal.backend && journal.backend !== "ufw") || journal.firewalld.some(c => c.runtime || c.permanent)) linuxFirewallFail("blocked", "安装目录仍记录其他防火墙后端，不能迁移 UFW 归属。");
+    const entries = await linuxUfwSnapshot(source);
+    linuxUfwParseStatus(linuxFirewallSuccess(await linuxFirewallRun(target, "ufw", ["status", "numbered"]), "校验目标 UFW 标记"), targetPlan.scope);
+    const transfers: FirewallRule[] = [];
+    for (const rule of targetPlan.rules) {
+      const relevant = entries.filter(e => linuxUfwCovers(e, rule));
+      if (relevant.some(e => /^NexusEdge:[0-9a-f]{20}:/.test(e.comment) && ![linuxUfwComment(sourcePlan.scope, rule), linuxUfwComment(targetPlan.scope, rule)].includes(e.comment))) linuxFirewallFail("blocked", "待迁移端口由其他规则或第三个安装覆盖；请先同步原安装规则并检查归属。");
+      const owned = relevant.filter(e => e.comment === linuxUfwComment(sourcePlan.scope, rule));
+      if (owned.length) {
+        if (owned.length !== 1 || relevant.filter(e => e.rule.key === rule.key).length !== 1) linuxFirewallFail("blocked", "待迁移的 UFW 规则存在重复内容，无法安全更新归属。");
+        transfers.push(rule);
+      }
+    }
+    for (const rule of transfers) {
+      const current = (await linuxUfwSnapshot(source)).filter(e => e.action === "ALLOW" && e.anySource && e.rule.key === rule.key);
+      if (current.length !== 1 || current[0]!.comment !== linuxUfwComment(sourcePlan.scope, rule)) linuxFirewallFail("blocked", "UFW 规则在迁移过程中发生变化，已停止归属更新。");
+      attempted.push(rule);
+      // Deliberate, narrowly verified exception: only relabel this exact known source-owned rule.
+      await linuxFirewallMutation(target, "ufw", linuxUfwSpec(targetPlan.scope, rule));
+      if (!(await linuxUfwSnapshot(target)).some(e => e.rule.key === rule.key && e.comment === linuxUfwComment(targetPlan.scope, rule))) linuxFirewallFail("error", "UFW 新归属校验失败，请恢复原安装归属。");
+    }
+    return { result: linuxFirewallResult(target, "synced", "UFW 中原安装拥有的端口规则已迁移到目标安装，手动规则保持原归属。"), rollback };
+  } catch (error) { return { result: failure(target, error), rollback }; }
+  finally { release?.(); }
+}
+
+export const linuxFirewallInternals = { key: linuxFirewallKey, ufwComment: linuxUfwComment, ufwSpec: linuxUfwSpec, ufwParseStatus: linuxUfwParseStatus, richRule: linuxFirewalldRichRule, chain: linuxIptablesChain, iptablesRule: linuxIptablesRule, iptablesOwner: linuxIptablesOwner, iptablesJump: linuxIptablesJump, words: linuxFirewallWords };
+
+
+// ==================== firewall.ts ====================
+import * as firewallCrypto from "node:crypto";
+import * as firewallFs from "node:fs";
+import * as firewallPath from "node:path";
+import * as firewallNet from "node:net";
+import * as firewallCp from "node:child_process";
+
+/** Only finite, local inbound ports belong in a firewall plan. No node credentials are retained. */
+export interface FirewallRule { key: string; protocol: "tcp" | "udp"; port: number; family: 4 | 6; destination: string }
+export interface FirewallPlan { scope: string; fingerprint: string; rules: FirewallRule[]; warnings: string[] }
+export type FirewallBackend = "windows" | "ufw" | "firewalld" | "iptables" | "none";
+export type FirewallStatus = "synced" | "needs-update" | "permission-required" | "inactive" | "unsupported" | "blocked" | "error";
+export interface FirewallResult { backend: FirewallBackend; status: FirewallStatus; /** True also when a failed mutation may have made partial changes. */ changed: boolean; detail: string; warnings: string[]; rules: FirewallRule[] }
+export interface FirewallOptions { linuxBackend: "auto" | "ufw" | "firewalld" | "iptables"; firewalldZone: string }
+export interface FirewallCommandOptions { stdin?: string; timeoutMs?: number; env?: Record<string, string> }
+export interface FirewallCommandResult { code: number; stdout: string; stderr: string }
+export type FirewallCommandRunner = (executable: string, args: string[], options?: FirewallCommandOptions) => Promise<FirewallCommandResult>;
+export interface FirewallOperationOptions extends Partial<FirewallOptions> { platform?: NodeJS.Platform; runner?: FirewallCommandRunner }
+export interface FirewallRecord { schema: 1; scope: string; fingerprint: string; updatedAt: string; result: FirewallResult }
+
+const FIREWALL_MAX_RULES = 128;
+const FIREWALL_MAX_OUTPUT = 1024 * 1024;
+const FIREWALL_STATUSES: readonly FirewallStatus[] = ["synced", "needs-update", "permission-required", "inactive", "unsupported", "blocked", "error"];
+const FIREWALL_BACKENDS: readonly FirewallBackend[] = ["windows", "ufw", "firewalld", "iptables", "none"];
+
+function firewallHash(value: unknown): string { return firewallCrypto.createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function firewallText(value: unknown, max = 1200): string { return String(value ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(0, max); }
+function firewallWarnings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.slice(0, 256).map(item => firewallText(item, 600)).filter(Boolean))].slice(0, 64);
+}
+
+export function firewallScope(paths: AppPaths, platform: NodeJS.Platform = process.platform): string {
+  const root = platform === "win32" ? firewallPath.win32.resolve(paths.root).replace(/\\+$/, "").toLowerCase() : firewallPath.resolve(paths.root);
+  return firewallHash(["nexus-edge-firewall-v1", platform, root]).slice(0, 20);
+}
+
+/** IPv6 normalization also makes all spellings of mapped IPv4 loopback recognizable. */
+function firewallIp(value: string): { family: 4 | 6; address: string; loopback: boolean; wildcard: boolean } {
+  if (typeof value !== "string" || value.includes("%") || value.length > 80 || value !== value.trim()) throw new Error("防火墙监听地址必须是有效的 IPv4 或 IPv6 地址。");
+  const family = firewallNet.isIP(value);
+  if (family === 4) return { family: 4, address: value, loopback: value.startsWith("127."), wildcard: value === "0.0.0.0" };
+  if (family !== 6) throw new Error("防火墙监听地址必须是有效的 IPv4 或 IPv6 地址。");
+  const canonical = new URL(`http://[${value}]/`).hostname.slice(1, -1).toLowerCase();
+  const mapped = canonical.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mapped) {
+    const high = parseInt(mapped[1]!, 16), low = parseInt(mapped[2]!, 16);
+    const address = `${high >>> 8}.${high & 255}.${low >>> 8}.${low & 255}`;
+    return firewallIp(address);
+  }
+  return { family: 6, address: canonical, loopback: canonical === "::1", wildcard: canonical === "::" };
+}
+
+function firewallRule(protocol: "tcp" | "udp", port: number, family: 4 | 6, destination: string): FirewallRule {
+  return { key: firewallHash([protocol, port, family, destination]).slice(0, 16), protocol, port, family, destination };
+}
+function firewallSortRules(rules: FirewallRule[]): FirewallRule[] {
+  const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  return [...rules].sort((a, b) => compareText(a.protocol, b.protocol) || a.port - b.port || a.family - b.family || compareText(a.destination, b.destination));
+}
+function firewallMakePlan(scope: string, rules: FirewallRule[], warnings: string[] = []): FirewallPlan {
+  const sorted = firewallSortRules([...new Map(rules.map(rule => [rule.key, rule])).values()]);
+  if (sorted.length > FIREWALL_MAX_RULES) throw new Error(`单次最多管理 ${FIREWALL_MAX_RULES} 条有限端口规则。`);
+  return { scope, fingerprint: firewallHash([scope, sorted]), rules: sorted, warnings: firewallWarnings(warnings) };
+}
+
+export function buildFirewallPlan(paths: AppPaths, config: AppConfig, platform: NodeJS.Platform = process.platform): FirewallPlan {
+  if (!Array.isArray(config.nodes) || config.nodes.length > 32) throw new Error("防火墙计划最多支持 32 个节点。");
+  const rules: FirewallRule[] = [], warnings: string[] = [];
+  for (const node of config.nodes) {
+    if (!node.enabled || !node.direct) continue;
+    const address = firewallIp(node.listen);
+    if (address.loopback) continue;
+    if (!Number.isInteger(node.port) || node.port < 1 || node.port > 65535) throw new Error("防火墙只接受 1–65535 范围内的本地监听端口。");
+    const destinations: { family: 4 | 6; destination: string }[] = address.wildcard
+      ? address.family === 6 ? [{ family: 4, destination: "0.0.0.0/0" }, { family: 6, destination: "::/0" }] : [{ family: 4, destination: "0.0.0.0/0" }]
+      : [{ family: address.family, destination: address.address }];
+    for (const protocol of nodeListenNetworks(node)) for (const destination of destinations) rules.push(firewallRule(protocol, node.port, destination.family, destination.destination));
+    if (node.protocol === "socks") warnings.push(`SOCKS5 ${node.port} 只自动放行 TCP 控制端口；UDP 转发使用动态端口，需按实际网络方案另外配置。`);
+    if (node.publicPort !== node.port) warnings.push(`已按本地监听端口 ${node.port} 放行；对外端口 ${node.publicPort} 的 NAT/路由器映射需在对应设备上配置。`);
+  }
+  return firewallMakePlan(firewallScope(paths, platform), rules, warnings);
+}
+
+/** Validate untrusted helper IPC again; do not accept arbitrary addresses, ranges or command text. */
+export function validateFirewallPlan(input: unknown, expectedScope: string): FirewallPlan {
+  if (!input || typeof input !== "object" || Array.isArray(input) || !/^[a-f0-9]{20}$/.test(expectedScope)) throw new Error("防火墙计划格式无效。");
+  const plan = input as Record<string, unknown>;
+  if (plan.scope !== expectedScope || !Array.isArray(plan.rules) || plan.rules.length > FIREWALL_MAX_RULES || !Array.isArray(plan.warnings) || plan.warnings.length > 64) throw new Error("防火墙计划不属于当前安装目录，或规则数量无效。");
+  const rules: FirewallRule[] = [];
+  for (const item of plan.rules) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("防火墙规则格式无效。");
+    const rule = item as Record<string, unknown>;
+    if (!(["tcp", "udp"] as unknown[]).includes(rule.protocol) || !Number.isInteger(rule.port) || Number(rule.port) < 1 || Number(rule.port) > 65535 || ![4, 6].includes(Number(rule.family)) || typeof rule.family !== "number" || typeof rule.destination !== "string") throw new Error("防火墙规则只允许有限的 TCP/UDP 监听端口。");
+    if (rule.destination !== (rule.family === 4 ? "0.0.0.0/0" : "::/0")) {
+      const ip = firewallIp(rule.destination);
+      if (ip.family !== rule.family || ip.loopback || ip.wildcard || ip.address !== rule.destination) throw new Error("防火墙规则的 IP 范围无效。");
+    }
+    const normalized = firewallRule(rule.protocol as "tcp" | "udp", rule.port as number, rule.family as 4 | 6, rule.destination);
+    if (rule.key !== normalized.key) throw new Error("防火墙规则校验失败。");
+    rules.push(normalized);
+  }
+  if (plan.warnings.some(warning => typeof warning !== "string" || warning.length > 600)) throw new Error("防火墙提示格式无效。");
+  const normalized = firewallMakePlan(expectedScope, rules, plan.warnings as string[]);
+  if (normalized.rules.length !== rules.length || normalized.fingerprint !== plan.fingerprint || JSON.stringify(normalized.rules) !== JSON.stringify(rules)) throw new Error("防火墙计划已损坏或顺序不规范。");
+  return normalized;
+}
+
+export const runFirewallCommand: FirewallCommandRunner = async (executable, args, options = {}) => {
+  if (options.stdin !== undefined && Buffer.byteLength(options.stdin, "utf8") > 256 * 1024) throw new Error("防火墙命令输入超出限制。");
+  return await new Promise<FirewallCommandResult>((resolve, reject) => {
+    const child = firewallCp.spawn(executable, args, { shell: false, windowsHide: true, stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C", LANG: "C", ...options.env } });
+    let stdout = "", stderr = "", bytes = 0, finished = false;
+    const finish = (error?: Error, code = -1) => { if (finished) return; finished = true; clearTimeout(timer); if (error) reject(error); else resolve({ code, stdout, stderr }); };
+    const timer = setTimeout(() => { child.kill(); finish(new Error("防火墙命令超时；实际规则可能已部分更新，请重新检查。")); }, Math.max(100, Math.min(options.timeoutMs ?? 30000, 300000)));
+    const collect = (chunk: string, stream: "stdout" | "stderr") => {
+      bytes += Buffer.byteLength(chunk, "utf8");
+      if (bytes > FIREWALL_MAX_OUTPUT) { child.kill(); finish(new Error("防火墙命令输出超出限制，请检查系统防火墙状态。")); return; }
+      if (stream === "stdout") stdout += chunk; else stderr += chunk;
+    };
+    child.stdout?.setEncoding("utf8").on("data", chunk => collect(chunk as string, "stdout"));
+    child.stderr?.setEncoding("utf8").on("data", chunk => collect(chunk as string, "stderr"));
+    child.on("error", error => finish(error));
+    child.on("close", code => finish(undefined, code ?? -1));
+    child.stdin?.on("error", error => { if ((error as NodeJS.ErrnoException).code !== "EPIPE") finish(error); });
+    if (options.stdin !== undefined) child.stdin?.end(options.stdin, "utf8");
+  });
+};
+
+function firewallResult(plan: FirewallPlan, backend: FirewallBackend, status: FirewallStatus, detail: string, changed = false, warnings: string[] = []): FirewallResult {
+  return { backend, status, changed, detail: firewallText(detail), warnings: firewallWarnings([...warnings, ...plan.warnings]), rules: plan.rules };
+}
+
+function firewallOptions(options: FirewallOperationOptions): FirewallOptions {
+  const linuxBackend = options.linuxBackend ?? "auto", firewalldZone = options.firewalldZone ?? "";
+  if (!["auto", "ufw", "firewalld", "iptables"].includes(linuxBackend) || typeof firewalldZone !== "string" || (firewalldZone !== "" && !/^[a-zA-Z0-9_-]{1,32}$/.test(firewalldZone))) throw new Error("防火墙后端或 firewalld 区域名称无效。");
+  return { linuxBackend, firewalldZone };
+}
+
+function firewallConfigOptions(config: AppConfig, options: FirewallOperationOptions): FirewallOperationOptions {
+  const saved = (config as AppConfig & { firewall?: Partial<FirewallOptions> }).firewall;
+  return { linuxBackend: saved?.linuxBackend ?? "auto", firewalldZone: saved?.firewalldZone ?? "", ...options };
+}
+
+async function firewallDispatch(paths: AppPaths, input: FirewallPlan, operation: "inspect" | "apply", options: FirewallOperationOptions = {}): Promise<FirewallResult> {
+  const platform = options.platform ?? process.platform;
+  const plan = validateFirewallPlan(input, firewallScope(paths, platform)), settings = firewallOptions(options);
+  const runner = options.runner ?? runFirewallCommand;
+  try {
+    if (platform === "win32") return await firewallWindows(paths, plan, operation, runner);
+    if (platform === "linux") {
+      const context = { stateFile: firewallPath.join(paths.data, "firewall-linux-state.json") };
+      const result = operation === "apply" ? await applyLinuxFirewall(plan, settings, runner, context) : await inspectLinuxFirewall(plan, settings, runner, context);
+      return firewallResult(plan, result.backend, result.status, result.detail, result.changed, result.warnings);
+    }
+    return firewallResult(plan, "none", "unsupported", platform === "darwin" ? "macOS 的应用防火墙不提供本工具所需的端口白名单接口；请在系统设置中允许对应内核接收入站连接。" : `此操作系统暂不支持自动配置端口白名单：${platform}。`);
+  } catch (error) {
+    const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+    return firewallResult(plan, platform === "win32" ? "windows" : "none", missing ? "unsupported" : "error", missing ? "系统缺少所需的防火墙管理工具。" : `防火墙操作未完成：${firewallText(errorMessage(error))}${operation === "apply" ? "；实际规则可能已部分更新，请重新检查。" : ""}`, !missing && operation === "apply");
+  }
+}
+
+export function inspectFirewallPlan(paths: AppPaths, plan: FirewallPlan, options: FirewallOperationOptions = {}): Promise<FirewallResult> { return firewallDispatch(paths, plan, "inspect", options); }
+export function applyFirewallPlan(paths: AppPaths, plan: FirewallPlan, options: FirewallOperationOptions = {}): Promise<FirewallResult> { return firewallDispatch(paths, plan, "apply", options); }
+export function inspectFirewall(paths: AppPaths, config: AppConfig, options: FirewallOperationOptions = {}): Promise<FirewallResult> { return inspectFirewallPlan(paths, buildFirewallPlan(paths, config, options.platform), firewallConfigOptions(config, options)); }
+export function applyFirewall(paths: AppPaths, config: AppConfig, options: FirewallOperationOptions = {}): Promise<FirewallResult> { return applyFirewallPlan(paths, buildFirewallPlan(paths, config, options.platform), firewallConfigOptions(config, options)); }
+export function removeFirewall(paths: AppPaths, config: AppConfig, options: FirewallOperationOptions = {}): Promise<FirewallResult> { return applyFirewallPlan(paths, firewallMakePlan(firewallScope(paths, options.platform), []), firewallConfigOptions(config, options)); }
+
+export function writeFirewallRecord(paths: AppPaths, plan: FirewallPlan, result: FirewallResult): void {
+  const normalized = validateFirewallPlan(plan, plan.scope);
+  if (!FIREWALL_STATUSES.includes(result.status) || !FIREWALL_BACKENDS.includes(result.backend) || typeof result.changed !== "boolean") throw new Error("防火墙状态格式无效。");
+  const record: FirewallRecord = { schema: 1, scope: normalized.scope, fingerprint: normalized.fingerprint, updatedAt: new Date().toISOString(), result: firewallResult(normalized, result.backend, result.status, result.detail, result.changed, result.warnings) };
+  // The parent directory already has the installation's private ACL. In particular,
+  // never reset Windows ACLs to an alternate UAC administrator's account here.
+  atomicWrite(firewallPath.join(paths.data, "firewall-state.json"), JSON.stringify(record, null, 2) + "\n", 0o644);
+}
+
+export function readFirewallRecord(paths: AppPaths): FirewallRecord | null {
+  try {
+    const file = firewallPath.join(paths.data, "firewall-state.json"), stat = firewallFs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 128 * 1024) return null;
+    const raw: unknown = JSON.parse(firewallFs.readFileSync(file, "utf8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const record = raw as FirewallRecord;
+    if (record.schema !== 1 || record.scope !== firewallScope(paths) || typeof record.updatedAt !== "string" || !Number.isFinite(Date.parse(record.updatedAt)) || !record.result || !FIREWALL_STATUSES.includes(record.result.status) || !FIREWALL_BACKENDS.includes(record.result.backend) || typeof record.result.changed !== "boolean") return null;
+    const plan = validateFirewallPlan({ scope: record.scope, fingerprint: record.fingerprint, rules: record.result.rules, warnings: record.result.warnings }, record.scope);
+    return { schema: 1, scope: plan.scope, fingerprint: plan.fingerprint, updatedAt: record.updatedAt, result: firewallResult(plan, record.result.backend, record.result.status, record.result.detail, record.result.changed) };
+  } catch { return null; }
+}
+
+// NetSecurity is queried in both PersistentStore and ActiveStore: a saved rule
+// alone is not evidence that Group Policy lets the current connection use it.
+// All installation data travels in JSON over stdin, never in executable syntax.
+// The tiny encoded loader also keeps 128-rule plans below Windows' argv limit.
+const FIREWALL_WINDOWS_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$script:changed = $false
+$script:warnings = @($p.warnings)
+$script:matchedPersistent = @()
+$script:matchedActive = @()
+$script:staleCount = 0
+$script:policyChecked = $false
+$script:serviceRunning = $false
+$script:ownershipConflicts = 0
+$mutex = $null
+$locked = $false
+function Finish([string]$status, [string]$detail) {
+  $result = @{schema=1; scope=$p.scope; fingerprint=$p.fingerprint; status=$status; changed=$changed; detail=$detail; warnings=@($warnings); matchedPersistent=@($matchedPersistent); matchedActive=@($matchedActive); staleCount=$staleCount; policyChecked=$policyChecked; serviceRunning=$serviceRunning; ownershipConflicts=$ownershipConflicts}
+  [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 8 -Compress))
+  exit 0
+}
+function Is-True($value) { return [string]$value -in @('True', '1') }
+function Is-False($value) { return [string]$value -in @('False', '0') }
+function Is-Any($value) { return @($value).Count -eq 1 -and [string]@($value)[0] -eq 'Any' }
+function Is-AllProfiles($value) {
+  $text = [string]$value
+  if ($text -in @('Any', '7', '2147483647')) { return $true }
+  $names = @($text.Split(',') | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
+  return ($names -join ',') -eq 'Domain,Private,Public'
+}
+function Marker([string]$key) { return ('NexusEdge managed inbound v1; scope=' + $p.scope + '; key=' + $key) }
+function Is-Owned($rule) {
+  $name = [string]$rule.Name
+  if ($name -cnotmatch ('^' + [regex]::Escape($p.prefix) + '[a-f0-9]{16}$')) { return $false }
+  $key = $name.Substring($p.prefix.Length)
+  return [string]$rule.Group -ceq [string]$p.group -and [string]$rule.Description -ceq (Marker $key)
+}
+function Candidates($all) {
+  return @($all | Where-Object { ([string]$_.Name).StartsWith($p.prefix, [StringComparison]::OrdinalIgnoreCase) -or [string]$_.Group -eq [string]$p.group })
+}
+function Windows-Address([string]$destination) {
+  if ($destination -eq '0.0.0.0/0') { return '0.0.0.0-255.255.255.255' }
+  if ($destination -eq '::/0') { return '::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' }
+  return $destination
+}
+function Same-Address($values, [string]$destination) {
+  if (@($values).Count -ne 1) { return $false }
+  $value = [string]@($values)[0]
+  if ($value -eq $destination -or $value -eq (Windows-Address $destination)) { return $true }
+  if ($destination -in @('0.0.0.0/0', '::/0') -or $value -eq 'Any') { return $false }
+  $a = $null; $b = $null
+  $parts = $value.Split('/')
+  if ($parts.Count -gt 2 -or -not [Net.IPAddress]::TryParse($parts[0], [ref]$a) -or -not [Net.IPAddress]::TryParse($destination, [ref]$b)) { return $false }
+  if ($parts.Count -eq 2 -and $parts[1] -ne $(if ($b.AddressFamily -eq 'InterNetwork') { '32' } else { '128' })) { return $false }
+  return $a.Equals($b)
+}
+function Matches($rule, $desired) {
+  if (-not (Is-Owned $rule) -or -not (Is-True $rule.Enabled) -or [string]$rule.Direction -ne 'Inbound' -or [string]$rule.Action -ne 'Allow' -or -not (Is-AllProfiles $rule.Profile) -or [string]$rule.EdgeTraversalPolicy -ne 'Block') { return $false }
+  $port = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+  $address = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
+  $app = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
+  $service = @($rule | Get-NetFirewallServiceFilter -ErrorAction Stop)
+  $interface = @($rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop)
+  $interfaceType = @($rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop)
+  $security = @($rule | Get-NetFirewallSecurityFilter -ErrorAction Stop)
+  if ($port.Count -ne 1 -or $address.Count -ne 1 -or $app.Count -ne 1 -or $service.Count -ne 1 -or $interface.Count -ne 1 -or $interfaceType.Count -ne 1 -or $security.Count -ne 1) { return $false }
+  $protocols = if ($desired.protocol -eq 'tcp') { @('TCP', '6') } else { @('UDP', '17') }
+  return [string]$port[0].Protocol -in $protocols -and @($port[0].LocalPort).Count -eq 1 -and [string]$port[0].LocalPort -eq [string]$desired.port -and (Is-Any $port[0].RemotePort) -and (Same-Address $address[0].LocalAddress $desired.destination) -and (Is-Any $address[0].RemoteAddress) -and [string]$app[0].Program -eq 'Any' -and [string]$app[0].Package -in @('', 'Any') -and [string]$service[0].Service -eq 'Any' -and (Is-Any $interface[0].InterfaceAlias) -and [string]$interfaceType[0].InterfaceType -eq 'Any' -and [string]$security[0].Authentication -eq 'NotRequired' -and [string]$security[0].Encryption -eq 'NotRequired' -and -not (Is-True $security[0].OverrideBlockRules)
+}
+function Profile-Applies($profile) {
+  if (Is-AllProfiles $profile) { return $true }
+  foreach ($name in ([string]$profile).Split(',')) { if ($name.Trim() -in $activeProfiles) { return $true } }
+  return $false
+}
+function Port-Overlaps($values, [int]$port) {
+  foreach ($value in @($values)) {
+    $text = [string]$value
+    if ($text -eq 'Any' -or $text -eq [string]$port) { return $true }
+    if ($text -match '^(\\d+)-(\\d+)$' -and $port -ge [int]$Matches[1] -and $port -le [int]$Matches[2]) { return $true }
+  }
+  return $false
+}
+function Bytes-Compare([byte[]]$a, [byte[]]$b) {
+  for ($i = 0; $i -lt $a.Length; $i++) { if ($a[$i] -lt $b[$i]) { return -1 }; if ($a[$i] -gt $b[$i]) { return 1 } }
+  return 0
+}
+function Address-Overlaps($values, $desired) {
+  foreach ($value in @($values)) {
+    $text = [string]$value
+    if ($text -eq 'Any') { return $true }
+    $pieces = $text -split '[/\\-]'
+    $network = $null
+    if (-not [Net.IPAddress]::TryParse($pieces[0], [ref]$network)) { return $true }
+    $family = if ($network.AddressFamily -eq 'InterNetwork') { 4 } else { 6 }
+    if ($family -ne [int]$desired.family) { continue }
+    if ($desired.destination -in @('0.0.0.0/0', '::/0')) { return $true }
+    $local = [Net.IPAddress]::Parse($desired.destination).GetAddressBytes()
+    $start = $network.GetAddressBytes()
+    if ($text.Contains('/')) {
+      $bits = 0
+      if ($pieces.Count -ne 2 -or -not [int]::TryParse($pieces[1], [ref]$bits) -or $bits -lt 0 -or $bits -gt ($local.Length * 8)) { return $true }
+      $same = $true
+      for ($i = 0; $i -lt $local.Length; $i++) {
+        $take = [Math]::Min(8, [Math]::Max(0, $bits - $i * 8))
+        $mask = if ($take -eq 0) { 0 } else { (255 -shl (8 - $take)) -band 255 }
+        if (($local[$i] -band $mask) -ne ($start[$i] -band $mask)) { $same = $false; break }
+      }
+      if ($same) { return $true }
+    } elseif ($text.Contains('-')) {
+      $end = $null
+      if ($pieces.Count -ne 2 -or -not [Net.IPAddress]::TryParse($pieces[1], [ref]$end) -or $end.AddressFamily -ne $network.AddressFamily) { return $true }
+      if ((Bytes-Compare $local $start) -ge 0 -and (Bytes-Compare $local $end.GetAddressBytes()) -le 0) { return $true }
+    } elseif ((Bytes-Compare $local $start) -eq 0) { return $true }
+  }
+  return $false
+}
+function Blocking-Rules($all) {
+  $names = @()
+  $reported = 0
+  foreach ($rule in @($all | Where-Object { (Is-True $_.Enabled) -and [string]$_.Direction -eq 'Inbound' -and [string]$_.Action -eq 'Block' })) {
+    if (-not (Profile-Applies $rule.Profile)) { continue }
+    $app = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
+    $service = $rule | Get-NetFirewallServiceFilter -ErrorAction Stop
+    if ([string]$app.Package -notin @('', 'Any') -or [string]$service.Service -notin @('', 'Any')) { continue }
+    $program = [Environment]::ExpandEnvironmentVariables([string]$app.Program)
+    if ($program -ne 'Any') {
+      try { $program = [IO.Path]::GetFullPath($program) } catch { continue }
+      if (-not $program.StartsWith($p.binRoot, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($program) -notin @('xray.exe', 'sing-box.exe')) { continue }
+      # Cached versions do not determine whether the selected core can connect.
+      if (@($p.programs).Count -gt 0 -and $program -notin @($p.programs)) { continue }
+    }
+    $port = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
+    $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
+    foreach ($desired in @($p.rules)) {
+      $protocols = if ($desired.protocol -eq 'tcp') { @('Any', '256', 'TCP', '6') } else { @('Any', '256', 'UDP', '17') }
+      if ([string]$port.Protocol -in $protocols -and (Port-Overlaps $port.LocalPort $desired.port) -and (Address-Overlaps $address.LocalAddress $desired)) {
+        $display = ([string]$rule.DisplayName).Substring(0, [Math]::Min(120, ([string]$rule.DisplayName).Length))
+        $interface = $rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop
+        $interfaceType = $rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop
+        $security = $rule | Get-NetFirewallSecurityFilter -ErrorAction Stop
+        $coversLocal = (Is-Any $address.LocalAddress) -or (Same-Address $address.LocalAddress $desired.destination) -or ($desired.destination -notin @('0.0.0.0/0', '::/0'))
+        $ruleProfiles = @(([string]$rule.Profile).Split(',') | ForEach-Object { $_.Trim() })
+        $coversProfiles = (Is-AllProfiles $rule.Profile) -or @($activeProfiles | Where-Object { $_ -notin $ruleProfiles }).Count -eq 0
+        $unrestrictedSecurity = [string]$security.Authentication -eq 'NotRequired' -and [string]$security.Encryption -eq 'NotRequired' -and [string]$security.LocalUserAuthorizedList -in @('', 'Any') -and [string]$security.RemoteUserAuthorizedList -in @('', 'Any') -and [string]$security.RemoteMachineAuthorizedList -in @('', 'Any')
+        $unrestricted = $program -eq 'Any' -and (Is-Any $port.RemotePort) -and (Is-Any $address.RemoteAddress) -and (Is-Any $interface.InterfaceAlias) -and [string]$interfaceType.InterfaceType -eq 'Any' -and $coversLocal -and $coversProfiles -and $unrestrictedSecurity
+        if ($unrestricted) { $names += $display }
+        elseif ($reported -lt 8) {
+          $script:warnings += ('检测到可能影响 ' + $desired.protocol.ToUpperInvariant() + '/' + $desired.port + ' 的现有阻止规则「' + $display + '」' + $(if ($program -ne 'Any') { '（程序：' + $program + '）' } else { '（仅针对部分来源、地址或网络接口）' }) + '。端口允许规则不会覆盖显式阻止规则；如连接失败，请在 Windows 高级防火墙中核对该规则。')
+          $reported++
+        }
+        break
+      }
+    }
+    if ($names.Count -ge 5) { break }
+  }
+  return $names
+}
+function Read-State {
+  $script:persistentAll = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop)
+  $script:activeAll = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop)
+  $script:owned = @(Candidates $persistentAll)
+  $activeCandidates = @(Candidates $activeAll)
+  if ($owned.Count -gt 512 -or $activeCandidates.Count -gt 512) { Finish 'blocked' '当前安装目录的防火墙规则数量异常；已停止自动修改。' }
+  $script:ownershipConflicts = @(@($owned) + @($activeCandidates) | Where-Object { -not (Is-Owned $_) }).Count
+  if ($ownershipConflicts -gt 0) { Finish 'blocked' '存在与本工具同名但所有权标记不同的防火墙规则；请先人工检查，工具不会覆盖它们。' }
+  $script:matchedPersistent = @()
+  $script:matchedActive = @()
+  foreach ($desired in @($p.rules)) {
+    $name = $p.prefix + $desired.key
+    $saved = @($owned | Where-Object { [string]$_.Name -ceq $name })
+    $effective = @($activeCandidates | Where-Object { [string]$_.Name -ceq $name })
+    if ($saved.Count -eq 1 -and (Matches $saved[0] $desired)) { $script:matchedPersistent += $desired.key }
+    if ($effective.Count -eq 1 -and (Matches $effective[0] $desired)) { $script:matchedActive += $desired.key }
+  }
+  $savedStale = @($owned | Where-Object { ([string]$_.Name).Substring($p.prefix.Length) -notin @($p.rules.key) }).Count
+  $activeStale = @($activeCandidates | Where-Object { ([string]$_.Name).Substring($p.prefix.Length) -notin @($p.rules.key) }).Count
+  $script:staleCount = [Math]::Max($savedStale, $activeStale)
+}
+function Check-Policy {
+  if (@($p.rules).Count -eq 0) { $script:policyChecked = $true; return }
+  if (-not $serviceRunning) { Finish 'inactive' 'Windows 防火墙服务未运行；工具没有启用服务或改变全局策略，无法确认端口规则生效。' }
+  $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+  $connections = @(Get-NetConnectionProfile -ErrorAction Stop)
+  $script:activeProfiles = @($connections | ForEach-Object { if ([string]$_.NetworkCategory -eq 'DomainAuthenticated') { 'Domain' } else { [string]$_.NetworkCategory } } | Sort-Object -Unique)
+  if ($activeProfiles.Count -eq 0) { $script:activeProfiles = @('Domain', 'Private', 'Public'); $script:warnings += '当前没有可识别的活动网络，已检查三个网络配置文件；连接建立后请再次检查。' }
+  if (@($activeProfiles | Where-Object { $_ -notin @('Domain', 'Private', 'Public') }).Count -gt 0) { Finish 'error' '无法识别当前 Windows 网络配置文件。' }
+  $enabledProfiles = 0
+  foreach ($name in $activeProfiles) {
+    $profile = @($profiles | Where-Object { [string]$_.Name -eq $name })
+    if ($profile.Count -ne 1) { Finish 'error' '无法读取当前网络的有效防火墙策略。' }
+    if (Is-False $profile[0].Enabled) { $script:warnings += ('当前 ' + $name + ' 网络的防火墙已关闭，工具没有改变此设置。'); continue }
+    $enabledProfiles++
+    if (Is-False $profile[0].AllowLocalFirewallRules) { Finish 'blocked' ('当前 ' + $name + ' 网络的组织策略不允许合并本地防火墙规则；需由管理员在组织策略中放行端口。') }
+    if (Is-False $profile[0].AllowInboundRules) {
+      if ([string]$profile[0].DefaultInboundAction -eq 'Allow') { Finish 'inactive' ('当前 ' + $name + ' 网络忽略入站规则并默认允许入站；本工具的端口规则不参与放行。') }
+      Finish 'blocked' ('当前 ' + $name + ' 网络启用了忽略入站允许规则的策略；新增本地规则无法覆盖该策略。')
+    }
+  }
+  if ($enabledProfiles -eq 0) { Finish 'inactive' '当前网络的 Windows 防火墙已关闭；工具没有改变全局设置。' }
+  $blocks = @(Blocking-Rules $activeAll)
+  if ($blocks.Count -gt 0) { $script:warnings += ('可能冲突的现有阻止规则：' + ($blocks -join '；')); Finish 'blocked' '检测到可能覆盖本地端口的显式阻止规则（例如之前拒绝过内核的联网提示）。阻止规则优先于允许规则，请在 Windows 高级防火墙中检查列出的规则；工具不会删除其他程序或系统创建的规则。' }
+  $script:policyChecked = $true
+}
+try {
+  foreach ($command in @('Get-NetFirewallRule', 'New-NetFirewallRule', 'Set-NetFirewallRule', 'Remove-NetFirewallRule', 'Get-NetFirewallPortFilter', 'Get-NetFirewallAddressFilter', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'Get-NetFirewallInterfaceFilter', 'Get-NetFirewallInterfaceTypeFilter', 'Get-NetFirewallSecurityFilter', 'Get-NetFirewallProfile', 'Get-NetConnectionProfile')) {
+    if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { Finish 'unsupported' '此 Windows 环境缺少 NetSecurity 防火墙管理接口。' }
+  }
+  $firewallService = Get-Service -Name MpsSvc -ErrorAction Stop
+  $script:serviceRunning = [string]$firewallService.Status -eq 'Running'
+  if (@($p.rules).Count -gt 0 -and -not $serviceRunning) { Finish 'inactive' 'Windows 防火墙服务未运行；工具没有启用服务或改变全局策略，无法确认端口规则生效。' }
+  if ($p.operation -eq 'apply') {
+    $admin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $admin) { Finish 'permission-required' '需要管理员权限才能添加、修复或清理 Windows 防火墙规则。' }
+    $mutex = [Threading.Mutex]::new($false, ('Global\\NexusEdge-Firewall-' + $p.scope))
+    try { $locked = $mutex.WaitOne(15000) } catch [Threading.AbandonedMutexException] { $locked = $true }
+    if (-not $locked) { Finish 'error' '另一个进程正在同步此安装目录的防火墙规则，请稍后重试。' }
+  }
+  Read-State
+  Check-Policy
+  if ($p.operation -eq 'inspect') {
+    if ($matchedPersistent.Count -eq @($p.rules).Count -and $matchedActive.Count -eq @($p.rules).Count -and $staleCount -eq 0) { Finish 'synced' '本工具管理的本地端口允许规则已进入有效策略；请同时查看应用程序阻止规则等提示。公网连接仍取决于云安全组、路由器和运营商网络。' }
+    Finish 'needs-update' '本地防火墙规则需要同步（包括新增端口、规则修复或清理已停用端口）。'
+  }
+  foreach ($desired in @($p.rules)) {
+    if ($desired.key -in $matchedPersistent) { continue }
+    $name = $p.prefix + $desired.key
+    $parameters = @{PolicyStore='PersistentStore'; Name=$name; DisplayName=('NexusEdge ' + $desired.protocol.ToUpperInvariant() + ' ' + $desired.port + ' IPv' + $desired.family); Group=$p.group; Description=(Marker $desired.key); Enabled='True'; Direction='Inbound'; Action='Allow'; Profile='Any'; Protocol=$desired.protocol.ToUpperInvariant(); LocalPort=[string]$desired.port; RemotePort='Any'; LocalAddress=(Windows-Address $desired.destination); RemoteAddress='Any'; Program='Any'; Service='Any'; InterfaceAlias='Any'; InterfaceType='Any'; EdgeTraversalPolicy='Block'; Authentication='NotRequired'; Encryption='NotRequired'; OverrideBlockRules=$false; LooseSourceMapping=$false; LocalOnlyMapping=$false}
+    $existing = @($owned | Where-Object { [string]$_.Name -ceq $name })
+    if ($existing.Count -gt 1) { Finish 'blocked' '检测到重复的防火墙规则标识，已停止修改。' }
+    if ($existing.Count -eq 0) { New-NetFirewallRule @parameters -ErrorAction Stop | Out-Null }
+    else {
+      $parameters.Remove('DisplayName'); $parameters.Remove('Group')
+      $parameters['NewDisplayName'] = 'NexusEdge ' + $desired.protocol.ToUpperInvariant() + ' ' + $desired.port + ' IPv' + $desired.family
+      Set-NetFirewallRule @parameters -ErrorAction Stop | Out-Null
+    }
+    $script:changed = $true
+  }
+  # Verify every new desired rule in both stores BEFORE deleting any old owned rule.
+  Read-State
+  Check-Policy
+  if ($matchedPersistent.Count -ne @($p.rules).Count -or $matchedActive.Count -ne @($p.rules).Count) { Finish 'blocked' '新端口规则尚未全部进入有效策略，旧规则已保留；请检查组织策略或安全软件。' }
+  foreach ($old in @($owned)) {
+    $key = ([string]$old.Name).Substring($p.prefix.Length)
+    if ($key -notin @($p.rules.key)) {
+      # Re-read and re-check ownership immediately before deleting this single name.
+      $current = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $old.Name -ErrorAction Stop)
+      if ($current.Count -ne 1 -or -not (Is-Owned $current[0])) { Finish 'blocked' '清理前检测到规则所有权变化，剩余旧规则已保留。' }
+      Remove-NetFirewallRule -PolicyStore PersistentStore -Name $old.Name -ErrorAction Stop
+      $script:changed = $true
+    }
+  }
+  Read-State
+  Check-Policy
+  if ($matchedPersistent.Count -ne @($p.rules).Count -or $matchedActive.Count -ne @($p.rules).Count -or $staleCount -ne 0) { Finish 'error' '防火墙规则已部分更新，但最终核验未通过；请重新检查。' }
+  Finish 'synced' $(if (@($p.rules).Count -eq 0) { '已清理当前安装目录拥有的端口规则。' } else { '本地端口允许规则已进入有效策略，适用于域、专用和公用网络；应用程序阻止规则仍可能拦截连接，请查看提示。公网连接还需云安全组和网络路由允许。' })
+} catch {
+  $exception = $_.Exception
+  $message = [string]$exception.Message
+  $denied = $exception -is [UnauthorizedAccessException] -or ([string]$_.FullyQualifiedErrorId -match 'AccessDenied|Unauthorized|PermissionDenied') -or ($exception.HResult -band 65535) -eq 5
+  if ($denied) { Finish 'permission-required' '系统拒绝了防火墙操作；需要管理员权限，或由组织管理员调整对应策略。' }
+  Finish 'error' ('防火墙操作未完成：' + $message.Substring(0, [Math]::Min(800, $message.Length)))
+} finally {
+  if ($locked -and $null -ne $mutex) { $mutex.ReleaseMutex() }
+  if ($null -ne $mutex) { $mutex.Dispose() }
+}
+`;
+
+const FIREWALL_WINDOWS_LOADER = String.raw`$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$e=[Console]::In.ReadToEnd()|ConvertFrom-Json;$p=$e.payload;& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($e.script))))`;
+
+function firewallWindowsCommand(paths: AppPaths, plan: FirewallPlan, operation: "inspect" | "apply") {
+  const programs: string[] = [], warnings: string[] = [];
+  try {
+    const selection = readCoreSelection(paths);
+    for (const core of [selection.active.xray, selection.active.singBox]) programs.push(firewallPath.win32.resolve(coreBinaryPath(paths, core)));
+  } catch { warnings.push("无法读取当前内核版本记录；应用程序级阻止规则只能按安装目录进行提示，请结合实际启动的内核检查。"); }
+  const payload = { schema: 1, operation, scope: plan.scope, fingerprint: plan.fingerprint, group: `NexusEdge-${plan.scope}`, prefix: `NexusEdge-${plan.scope}-`, binRoot: firewallPath.win32.resolve(paths.bin).replace(/\\+$/, "") + "\\", rules: plan.rules, programs, warnings };
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  return {
+    executable: firewallPath.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(FIREWALL_WINDOWS_LOADER, "utf16le").toString("base64")],
+    options: { stdin: JSON.stringify({ script: Buffer.from(FIREWALL_WINDOWS_SCRIPT, "utf8").toString("base64"), payload }), timeoutMs: Math.min(300000, 90000 + plan.rules.length * 1200) },
+  };
+}
+
+function firewallWindowsResponse(plan: FirewallPlan, response: FirewallCommandResult, operation: "inspect" | "apply" = "inspect"): FirewallResult {
+  if (response.code !== 0) return firewallResult(plan, "windows", "error", `Windows 防火墙命令失败（退出码 ${response.code}）：${firewallText(response.stderr || response.stdout, 800)}${operation === "apply" ? "；实际规则可能已部分更新，请重新检查。" : ""}`, operation === "apply");
+  try {
+    if (Buffer.byteLength(response.stdout, "utf8") > FIREWALL_MAX_OUTPUT) throw new Error("output too large");
+    const raw: unknown = JSON.parse(response.stdout.replace(/^\uFEFF/, "").trim());
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid response");
+    const value = raw as Record<string, unknown>;
+    if (value.schema !== 1 || value.scope !== plan.scope || value.fingerprint !== plan.fingerprint || !FIREWALL_STATUSES.includes(value.status as FirewallStatus) || typeof value.changed !== "boolean" || typeof value.detail !== "string" || !Array.isArray(value.warnings)) throw new Error("mismatched response");
+    if (value.status === "synced") {
+      const expected = plan.rules.map(rule => rule.key).sort();
+      const equalKeys = (keys: unknown) => Array.isArray(keys) && keys.every(key => typeof key === "string") && JSON.stringify([...keys].sort()) === JSON.stringify(expected);
+      if (!equalKeys(value.matchedPersistent) || !equalKeys(value.matchedActive) || value.staleCount !== 0 || value.ownershipConflicts !== 0 || value.policyChecked !== true || (plan.rules.length > 0 && value.serviceRunning !== true)) throw new Error("missing active verification");
+    }
+    return firewallResult(plan, "windows", value.status as FirewallStatus, value.detail, value.changed, firewallWarnings(value.warnings));
+  } catch {
+    return firewallResult(plan, "windows", "error", "Windows 防火墙没有返回可核验的完整结果；请重新检查实际规则，不能据此认定端口已放行。", operation === "apply");
+  }
+}
+
+async function firewallWindows(paths: AppPaths, plan: FirewallPlan, operation: "inspect" | "apply", runner: FirewallCommandRunner): Promise<FirewallResult> {
+  const command = firewallWindowsCommand(paths, plan, operation);
+  return firewallWindowsResponse(plan, await runner(command.executable, command.args, command.options), operation);
+}
+
+export const firewallInternals = { ip: firewallIp, makePlan: firewallMakePlan, makeRule: firewallRule, windowsCommand: firewallWindowsCommand, windowsResponse: firewallWindowsResponse, windowsScript: FIREWALL_WINDOWS_SCRIPT, windowsLoader: FIREWALL_WINDOWS_LOADER };
+
+
+// ==================== firewall-control.ts ====================
+import * as controlFs from "node:fs";
+import * as controlPath from "node:path";
+import * as controlCrypto from "node:crypto";
+
+export interface FirewallInteractiveOptions {
+  /** Explicit management actions also work when automatic management is disabled. */
+  force?: boolean;
+  remove?: boolean;
+  expectedConfigHash?: string;
+  report?: (result: FirewallResult) => void;
+}
+
+/** Every privileged/OS operation is injectable; the test suite never changes a host firewall. */
+export interface FirewallControlDependencies {
+  platform: NodeJS.Platform;
+  isAdministrator: () => boolean;
+  inspect: (paths: AppPaths, plan: FirewallPlan, options?: FirewallOperationOptions) => Promise<FirewallResult>;
+  apply: (paths: AppPaths, plan: FirewallPlan, options?: FirewallOperationOptions) => Promise<FirewallResult>;
+  elevate: (paths: AppPaths, args: string[]) => Promise<void>;
+  readRecord: (paths: AppPaths) => FirewallRecord | null;
+  writeRecord: (paths: AppPaths, plan: FirewallPlan, result: FirewallResult) => void;
+  now: () => number;
+}
+
+interface FirewallRequest {
+  schema: 1;
+  nonce: string;
+  scope: string;
+  createdAt: number;
+  expectedConfigHash: string;
+  plan: FirewallPlan;
+  options: FirewallOptions;
+}
+interface FirewallReceipt {
+  schema: 1;
+  nonce: string;
+  scope: string;
+  fingerprint: string;
+  result: FirewallResult;
+}
+
+const CONTROL_IPC_LIMIT = 256 * 1024;
+const CONTROL_CONFIG_LIMIT = 8 * 1024 * 1024;
+const CONTROL_REQUEST_AGE = 30 * 60 * 1000;
+const CONTROL_NONCE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CONTROL_HASH = /^[0-9a-f]{64}$/;
+
+function controlDependencies(overrides: Partial<FirewallControlDependencies>): FirewallControlDependencies {
+  return { platform: process.platform, isAdministrator, inspect: inspectFirewallPlan, apply: applyFirewallPlan, elevate: runElevated, readRecord: readFirewallRecord, writeRecord: writeFirewallRecord, now: Date.now, ...overrides };
+}
+
+function controlObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("防火墙请求或回执格式无效。");
+  return value as Record<string, unknown>;
+}
+
+function controlExactKeys(value: Record<string, unknown>, keys: string[]): void {
+  if (Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))) throw new Error("防火墙请求或回执包含不支持的字段。");
+}
+
+function controlDataDirectory(paths: AppPaths): void {
+  const stat = controlFs.lstatSync(paths.data);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("防火墙请求必须位于当前安装已有的数据目录中。");
+}
+
+/** Open first, verify identity, then read/write through the descriptor. Never replace a caller-owned receipt as root. */
+function controlOpenRegular(file: string, writable = false, limit = CONTROL_IPC_LIMIT): number {
+  const before = controlFs.lstatSync(file);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > limit) throw new Error("防火墙文件不是独立的普通文件，或文件过大。");
+  const flags = (writable ? controlFs.constants.O_RDWR : controlFs.constants.O_RDONLY) | (controlFs.constants.O_NOFOLLOW ?? 0);
+  const fd = controlFs.openSync(file, flags);
+  try {
+    const opened = controlFs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size > limit || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("防火墙文件在打开时发生变化。");
+    return fd;
+  } catch (error) { controlFs.closeSync(fd); throw error; }
+}
+
+function controlReadJsonFd(fd: number, limit = CONTROL_IPC_LIMIT): unknown {
+  const buffer = Buffer.alloc(limit + 1);
+  let bytes = 0;
+  while (bytes < buffer.length) {
+    const count = controlFs.readSync(fd, buffer, bytes, buffer.length - bytes, bytes);
+    if (!count) break;
+    bytes += count;
+  }
+  if (bytes > limit) throw new Error("防火墙文件超过大小限制。");
+  try { return JSON.parse(buffer.subarray(0, bytes).toString("utf8")); }
+  catch { throw new Error("防火墙请求、回执或已保存配置不是有效的 JSON；原文件已保留。"); }
+}
+
+function controlReadJson(file: string, limit = CONTROL_IPC_LIMIT): unknown {
+  const fd = controlOpenRegular(file, false, limit);
+  try { return controlReadJsonFd(fd, limit); }
+  finally { controlFs.closeSync(fd); }
+}
+
+function controlSavedHash(paths: AppPaths): string {
+  controlDataDirectory(paths);
+  // Do not call readConfig here: a sudo/UAC child must neither migrate the user's
+  // configuration nor replace its ownership/Windows ACLs while opening a port.
+  const saved = validateConfig(controlReadJson(paths.config, CONTROL_CONFIG_LIMIT), { allowExpiredCertificate: true });
+  return configFingerprint(saved);
+}
+
+function controlAssertSaved(paths: AppPaths, expected: string): void {
+  if (!CONTROL_HASH.test(expected)) throw new Error("防火墙请求的配置校验值无效。");
+  if (controlSavedHash(paths) !== expected) throw new Error("配置已在其他位置修改，请刷新后重新应用。原配置不会被此次操作覆盖；如已执行端口操作，请重新同步防火墙。");
+}
+
+function controlSettings(value: unknown): FirewallOptions {
+  const raw = controlObject(value);
+  controlExactKeys(raw, ["linuxBackend", "firewalldZone"]);
+  if (typeof raw.linuxBackend !== "string" || !["auto", "ufw", "firewalld", "iptables"].includes(raw.linuxBackend) || typeof raw.firewalldZone !== "string" || (raw.firewalldZone !== "" && !/^[a-zA-Z0-9_-]{1,32}$/.test(raw.firewalldZone))) throw new Error("防火墙后端或 firewalld 区域名称无效。");
+  return { linuxBackend: raw.linuxBackend as FirewallOptions["linuxBackend"], firewalldZone: raw.firewalldZone };
+}
+
+function controlResult(value: unknown, plan: FirewallPlan): FirewallResult {
+  const raw = controlObject(value);
+  controlExactKeys(raw, ["backend", "status", "changed", "detail", "warnings", "rules"]);
+  if (typeof raw.backend !== "string" || !["windows", "ufw", "firewalld", "iptables", "none"].includes(raw.backend) || typeof raw.status !== "string" || !["synced", "needs-update", "permission-required", "inactive", "unsupported", "blocked", "error"].includes(raw.status) || typeof raw.changed !== "boolean" || typeof raw.detail !== "string" || raw.detail.length > 4096 || !Array.isArray(raw.warnings) || raw.warnings.length > 64 || raw.warnings.some(item => typeof item !== "string" || item.length > 600) || JSON.stringify(raw.rules) !== JSON.stringify(plan.rules)) throw new Error("防火墙回执内容无效，未确认本机规则状态。");
+  return { backend: raw.backend as FirewallResult["backend"], status: raw.status as FirewallResult["status"], changed: raw.changed, detail: raw.detail, warnings: [...raw.warnings] as string[], rules: plan.rules };
+}
+
+function controlError(plan: FirewallPlan, platform: NodeJS.Platform, error: unknown): FirewallResult {
+  return { backend: platform === "win32" ? "windows" : "none", status: "error", changed: false, detail: `防火墙操作未完成：${errorMessage(error).slice(0, 1800)}`, warnings: plan.warnings, rules: plan.rules };
+}
+
+function controlEmpty(plan: FirewallPlan): FirewallResult {
+  return { backend: "none", status: "synced", changed: false, detail: "当前没有需要放行的直连监听端口，也没有本工具记录的旧规则。", warnings: plan.warnings, rules: [] };
+}
+
+function controlRemember(paths: AppPaths, plan: FirewallPlan, result: FirewallResult, deps: FirewallControlDependencies): FirewallResult {
+  try { deps.writeRecord(paths, plan, result); return result; }
+  catch {
+    return { ...result, warnings: [...new Set([...result.warnings.slice(0, 63), "端口操作结果已返回，但无法保存状态记录；下次使用时会重新检查实际防火墙规则。"])] };
+  }
+}
+
+function controlRequestFiles(paths: AppPaths, nonce: string): { request: string; result: string } {
+  if (!CONTROL_NONCE.test(nonce)) throw new Error("无效的防火墙请求 ID。");
+  return { request: controlPath.join(paths.data, `firewall-request-${nonce}.json`), result: controlPath.join(paths.data, `firewall-result-${nonce}.json`) };
+}
+
+/** Synchronize only the requested finite port plan; configuration is always written by the ordinary panel afterwards. */
+export async function syncFirewallInteractive(paths: AppPaths, candidate: AppConfig, options: FirewallInteractiveOptions = {}, overrides: Partial<FirewallControlDependencies> = {}): Promise<FirewallResult | null> {
+  const settings = getFirewallSettings(candidate);
+  if (settings.mode === "manual" && !options.force && !options.remove) return null;
+  const deps = controlDependencies(overrides);
+  const plan = buildFirewallPlan(paths, options.remove ? { ...candidate, nodes: [] } : candidate, deps.platform);
+  const firewallOptions = controlSettings({ linuxBackend: settings.linuxBackend, firewalldZone: settings.firewalldZone });
+  const expected = options.expectedConfigHash ?? controlSavedHash(paths);
+  controlAssertSaved(paths, expected);
+  if (!options.force && !options.remove && !plan.rules.length && !deps.readRecord(paths)) {
+    const result = controlEmpty(plan);
+    options.report?.(result);
+    return result;
+  }
+  let result: FirewallResult;
+  if (deps.isAdministrator()) {
+    result = controlResult(await deps.apply(paths, plan, { ...firewallOptions, platform: deps.platform }), plan);
+    controlAssertSaved(paths, expected);
+  } else {
+    const inspected = controlResult(await deps.inspect(paths, plan, { ...firewallOptions, platform: deps.platform }), plan);
+    controlAssertSaved(paths, expected);
+    if (!["needs-update", "permission-required"].includes(inspected.status)) result = inspected;
+    else {
+      const nonce = controlCrypto.randomUUID(), files = controlRequestFiles(paths, nonce);
+      const request: FirewallRequest = { schema: 1, nonce, scope: plan.scope, createdAt: deps.now(), expectedConfigHash: expected, plan, options: firewallOptions };
+      const requestText = JSON.stringify(request) + "\n";
+      if (Buffer.byteLength(requestText, "utf8") > CONTROL_IPC_LIMIT) throw new Error("防火墙请求过大。");
+      controlDataDirectory(paths);
+      let createdRequest = false, createdResult = false;
+      try {
+        controlFs.writeFileSync(files.request, requestText, { flag: "wx", mode: 0o600 }); createdRequest = true;
+        // A privileged child writes to this descriptor in place, preserving the
+        // original caller's uid/gid and avoiding unreadable root-owned receipts.
+        controlFs.writeFileSync(files.result, JSON.stringify({ schema: 1, nonce, scope: plan.scope, pending: true }) + "\n", { flag: "wx", mode: 0o600 }); createdResult = true;
+        controlAssertSaved(paths, expected);
+        await deps.elevate(paths, ["--firewall-request", nonce]);
+        controlAssertSaved(paths, expected);
+        const receipt = controlObject(controlReadJson(files.result));
+        controlExactKeys(receipt, ["schema", "nonce", "scope", "fingerprint", "result"]);
+        if (receipt.schema !== 1 || receipt.nonce !== nonce || receipt.scope !== plan.scope || receipt.fingerprint !== plan.fingerprint) throw new Error("防火墙回执与本次请求不匹配，请重新同步。");
+        result = controlResult(receipt.result, plan);
+      } finally {
+        if (createdRequest) try { controlFs.unlinkSync(files.request); } catch { /* Preserve the operation/UAC error. */ }
+        if (createdResult) try { controlFs.unlinkSync(files.result); } catch { /* Preserve the operation/UAC error. */ }
+      }
+    }
+  }
+  result = controlRemember(paths, plan, result, deps);
+  options.report?.(result);
+  return result;
+}
+
+/** Internal UAC/sudo entry. It never redirects installations or reads/mutates node secrets beyond validating the saved hash. */
+export async function runFirewallRequest(paths: AppPaths, requestId: string, overrides: Partial<FirewallControlDependencies> = {}): Promise<number> {
+  const deps = controlDependencies(overrides), files = controlRequestFiles(paths, requestId);
+  controlDataDirectory(paths);
+  const raw = controlObject(controlReadJson(files.request));
+  controlExactKeys(raw, ["schema", "nonce", "scope", "createdAt", "expectedConfigHash", "plan", "options"]);
+  const scope = firewallScope(paths, deps.platform);
+  if (raw.schema !== 1 || raw.nonce !== requestId || raw.scope !== scope || typeof raw.createdAt !== "number" || !Number.isFinite(raw.createdAt) || raw.createdAt > deps.now() + 60000 || deps.now() - raw.createdAt > CONTROL_REQUEST_AGE || typeof raw.expectedConfigHash !== "string" || !CONTROL_HASH.test(raw.expectedConfigHash)) throw new Error("防火墙请求无效、已过期或不属于当前安装目录。");
+  const plan = validateFirewallPlan(raw.plan, scope), settings = controlSettings(raw.options);
+  const resultFd = controlOpenRegular(files.result, true);
+  try {
+    const placeholder = controlObject(controlReadJsonFd(resultFd));
+    controlExactKeys(placeholder, ["schema", "nonce", "scope", "pending"]);
+    if (placeholder.schema !== 1 || placeholder.nonce !== requestId || placeholder.scope !== scope || placeholder.pending !== true) throw new Error("防火墙请求已执行，或回执文件与请求不匹配。");
+    let result: FirewallResult;
+    try {
+      if (!deps.isAdministrator()) result = { ...controlError(plan, deps.platform, "需要管理员 / root 权限。"), status: "permission-required" };
+      else {
+        controlAssertSaved(paths, raw.expectedConfigHash);
+        result = controlResult(await deps.apply(paths, plan, { ...settings, platform: deps.platform }), plan);
+        controlAssertSaved(paths, raw.expectedConfigHash);
+      }
+    } catch (error) { result = controlError(plan, deps.platform, error); }
+    const receipt: FirewallReceipt = { schema: 1, nonce: requestId, scope, fingerprint: plan.fingerprint, result };
+    const text = JSON.stringify(receipt) + "\n";
+    if (Buffer.byteLength(text, "utf8") > CONTROL_IPC_LIMIT) throw new Error("防火墙回执过大。");
+    // Write at an explicit offset: reading the pending receipt must not advance
+    // the subsequent output position. No rename/chmod/chown of user files.
+    const output = Buffer.from(text, "utf8");
+    let written = 0;
+    while (written < output.length) {
+      const count = controlFs.writeSync(resultFd, output, written, output.length - written, written);
+      if (!count) throw new Error("防火墙回执未能完整写入。");
+      written += count;
+    }
+    controlFs.ftruncateSync(resultFd, output.length);
+    controlFs.fsyncSync(resultFd);
+    return 0;
+  } finally { controlFs.closeSync(resultFd); }
+}
+
+/** Worker startup may inspect/sync with its current privileges, but it can never display UAC or ask for sudo. */
+export async function syncFirewallBackground(paths: AppPaths, config: AppConfig, overrides: Partial<FirewallControlDependencies> = {}): Promise<FirewallResult | null> {
+  const settings = getFirewallSettings(config);
+  if (settings.mode === "manual") return null;
+  const deps = controlDependencies(overrides), plan = buildFirewallPlan(paths, config, deps.platform);
+  if (!plan.rules.length && !deps.readRecord(paths)) return controlEmpty(plan);
+  let result: FirewallResult;
+  try {
+    controlAssertSaved(paths, configFingerprint(config));
+    const firewallOptions = { ...controlSettings({ linuxBackend: settings.linuxBackend, firewalldZone: settings.firewalldZone }), platform: deps.platform };
+    const admin = deps.isAdministrator();
+    result = controlResult(await (admin ? deps.apply(paths, plan, firewallOptions) : deps.inspect(paths, plan, firewallOptions)), plan);
+    controlAssertSaved(paths, configFingerprint(config));
+    if (!admin && result.status === "needs-update") result = { ...result, status: "permission-required", detail: "本机防火墙规则需要更新。后台不会请求提权；请在管理面板中同步端口白名单。" };
+  } catch (error) { result = controlError(plan, deps.platform, error); }
+  return controlRemember(paths, plan, result, deps);
+}
+
+
 // ==================== daemon.ts ====================
 import * as daemonFs from "node:fs";
 import * as daemonPath from "node:path";
@@ -3434,6 +4811,7 @@ export interface DaemonOptions {
   skipPreflight?: boolean;
   healthIntervalMs?: number;
   backoffBaseMs?: number;
+  firewall?: (paths: AppPaths, config: AppConfig) => Promise<FirewallResult | null>;
 }
 
 interface DaemonJob {
@@ -3488,6 +4866,20 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases });
     else if (!injectedAll) binaries = await ensureBinaries(paths, config, message => logger!.write(message), releases);
     if (abort.signal.aborted) return;
+    let firewall: DaemonStatus["firewall"];
+    if (options.firewall || !(injectedAll && options.skipPreflight)) {
+      try {
+        const result = await (options.firewall ?? syncFirewallBackground)(paths, config);
+        if (result) firewall = { status: result.status, backend: result.backend, detail: result.detail, warnings: result.warnings };
+      } catch (error) {
+        firewall = { status: "error", backend: "none", detail: `防火墙同步未完成：${errorMessage(error)}`, warnings: [] };
+      }
+      if (firewall) {
+        logger.write(`[firewall] ${firewall.status} / ${firewall.backend}：${firewall.detail}`);
+        for (const warning of firewall.warnings) logger.write(`[firewall] ${warning}`);
+      }
+    }
+    if (abort.signal.aborted) return;
     const runtime: RuntimeRecord = {
       schema: 1, instanceId, pid: process.pid, startedAt,
       controlPort: 0, controlToken: daemonCrypto.randomBytes(32).toString("hex"), configHash: configFingerprint(config),
@@ -3502,7 +4894,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         tunnelState: node.enabled && node.tunnel.mode !== "none" ? "starting" : "disabled", tunnelRestarts: 0,
         domain: node.tunnel.mode === "fixed" ? node.tunnel.domain : null,
         links: [], lastError: null, detail: node.enabled ? "等待本地核心监听。" : "节点已禁用，未启动监听或隧道。",
-      })), links: [], lastError: null,
+      })), links: [], lastError: null, ...(firewall ? { firewall } : {}),
     };
     const nodeStates = new Map(status.nodes.map(node => [node.id, node]));
     const nodeConfigs = new Map(config.nodes.map(node => [node.id, node]));
@@ -3776,6 +5168,15 @@ export async function runCoreHost(executable: string, args: string[]): Promise<n
 
 
 // ==================== migration.ts ====================
+import * as migrationFs from "node:fs";
+import * as migrationPath from "node:path";
+
+export interface MigrationFirewallTransaction {
+  /** Restore the source's rule ownership before it is restarted. */
+  rollback(): Promise<void>;
+  /** Clean the source only after the target is active and ready. */
+  complete(): Promise<void>;
+}
 
 export interface MigrationOperations {
   getStatus(paths: AppPaths): Promise<DaemonStatus | null>;
@@ -3791,6 +5192,56 @@ export interface MigrationOperations {
   waitReady(paths: AppPaths): Promise<DaemonStatus | null>;
   activate(paths: AppPaths): Promise<void>;
   deactivate(paths: AppPaths): Promise<void>;
+  prepareFirewall?(source: AppPaths, target: AppPaths): Promise<MigrationFirewallTransaction | undefined>;
+}
+
+function migrationRequireFirewall(result: FirewallResult | null, action: string): void {
+  if (result && !["synced", "inactive", "unsupported"].includes(result.status)) throw new Error(`${action}：${result.detail}`);
+  if (result) {
+    console.log(`${action}：${result.detail}`);
+    for (const warning of result.warnings) console.log(`防火墙提示：${warning}`);
+  }
+}
+
+async function migrationPrepareFirewall(source: AppPaths, target: AppPaths): Promise<MigrationFirewallTransaction | undefined> {
+  // Elevation must not reset the portable user's directory ACL while reading its configuration.
+  const sourceConfig = validateConfig(JSON.parse(migrationFs.readFileSync(source.config, "utf8")), { allowExpiredCertificate: true });
+  const targetConfig = readConfig(target);
+  const sourceHash = configFingerprint(sourceConfig);
+  if (configFingerprint(targetConfig) !== sourceHash) throw new Error("复制期间原配置已被修改，尚未停止原后台。请重新执行系统安装。");
+  if (getFirewallSettings(targetConfig).mode === "manual") return undefined;
+  let transfer: LinuxUfwOwnershipTransfer | undefined;
+  const rollback = async () => {
+    // UFW cannot store duplicate rule bodies: restore the old comment before
+    // cleaning the target so that the source's still-needed port is not deleted.
+    if (transfer) migrationRequireFirewall(await transfer.rollback(), "恢复原安装的防火墙规则归属");
+    migrationRequireFirewall(await syncFirewallInteractive(target, targetConfig, { remove: true, force: true }), "清理未启用系统副本的规则");
+  };
+  try {
+    const sourcePlan = buildFirewallPlan(source, sourceConfig), targetPlan = buildFirewallPlan(target, targetConfig);
+    if (process.platform === "linux" && sourcePlan.rules.length) {
+      transfer = await transferLinuxUfwOwnership(sourcePlan, targetPlan, runFirewallCommand,
+        { stateFile: migrationPath.join(source.data, "firewall-linux-state.json") },
+        { stateFile: migrationPath.join(target.data, "firewall-linux-state.json") });
+      migrationRequireFirewall(transfer.result, "准备防火墙归属迁移");
+    }
+    const ready = await syncFirewallBackground(target, targetConfig);
+    migrationRequireFirewall(ready, "准备系统副本的防火墙规则");
+    const latestSource = validateConfig(JSON.parse(migrationFs.readFileSync(source.config, "utf8")), { allowExpiredCertificate: true });
+    if (configFingerprint(latestSource) !== sourceHash) throw new Error("准备防火墙期间原配置已被修改，尚未停止原后台。请重新执行系统安装。");
+    return {
+      rollback,
+      complete: async () => {
+        if (ready?.status === "synced" && (sourcePlan.rules.length || readFirewallRecord(source) || transfer?.result.changed)) {
+          migrationRequireFirewall(await syncFirewallInteractive(source, sourceConfig, { remove: true, force: true }), "清理原安装的防火墙规则");
+        }
+      },
+    };
+  } catch (error) {
+    try { await rollback(); }
+    catch (rollbackError) { throw new Error(`${errorMessage(error)}\n防火墙恢复未完成：${errorMessage(rollbackError)}`); }
+    throw error;
+  }
 }
 
 const migrationDefaults: MigrationOperations = {
@@ -3798,6 +5249,7 @@ const migrationDefaults: MigrationOperations = {
   preflight: async paths => { await preflightCores(paths, readConfig(paths)); }, enable: enableStartup, disable: disableStartup,
   startManaged, stopManaged, startPortable: startDetachedDaemon, stopPortable: stopDaemonGracefully,
   waitReady: paths => waitForReady(paths, 45000), activate: activateSystemInstallation, deactivate: deactivateSystemInstallation,
+  prepareFirewall: migrationPrepareFirewall,
 };
 
 /**
@@ -3814,7 +5266,9 @@ export async function migrateSystemInstallation(paths: AppPaths, operations: Mig
   let targetTouched = false;
   let targetStartAttempted = false;
   let sourceAutostartTouched = false;
+  let firewall: MigrationFirewallTransaction | undefined;
   try {
+    firewall = await operations.prepareFirewall?.(paths, target);
     if (sourceStartup.mode === "none") await operations.stopPortable(paths);
     else await operations.stopManaged(paths);
     sourceStopped = true;
@@ -3829,6 +5283,8 @@ export async function migrateSystemInstallation(paths: AppPaths, operations: Mig
       await operations.disable(paths);
     }
     await operations.activate(target);
+    try { await firewall?.complete(); }
+    catch (error) { console.log(`系统副本已就绪；原目录的防火墙规则清理未完成：${errorMessage(error)}`); }
     return target;
   } catch (originalError) {
     const failures: string[] = [];
@@ -3840,6 +5296,10 @@ export async function migrateSystemInstallation(paths: AppPaths, operations: Mig
     if (targetTouched) {
       try { await operations.disable(target); }
       catch (e) { targetSafelyStopped = false; failures.push(`系统副本自启关闭失败：${errorMessage(e)}`); }
+    }
+    if (targetSafelyStopped && firewall) {
+      try { await firewall.rollback(); }
+      catch (e) { failures.push(`原防火墙规则恢复失败：${errorMessage(e)}`); }
     }
     try { await operations.deactivate(target); }
     catch (e) { failures.push(`系统副本激活标记恢复失败：${errorMessage(e)}`); }
@@ -4104,7 +5564,7 @@ export async function selectMenu(title: string, information: string, choices: st
       if (information) console.log(information + "\n");
       console.log(`${uiAnsi.bold}${title}${uiAnsi.reset}\n`);
       choices.forEach((choice, index) => console.log(index === selected ? `${uiAnsi.cyan}  › ${index + 1}. ${choice}${uiAnsi.reset}` : `    ${index + 1}. ${choice}`));
-      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择 · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
+      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择${choices.length === 10 ? "（0 选第 10 项）" : ""} · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
     };
     const cleanup = () => {
       process.stdin.removeListener("keypress", onKey);
@@ -4121,6 +5581,7 @@ export async function selectMenu(title: string, information: string, choices: st
       else if (key.name === "down" || key.name === "j") selected = (selected + 1) % choices.length;
       else if (key.name === "return") { cleanup(); resolve(selected); return; }
       else if (/^[1-9]$/.test(text) && Number(text) <= choices.length) { cleanup(); resolve(Number(text) - 1); return; }
+      else if (text === "0" && choices.length === 10) { cleanup(); resolve(9); return; }
       else return;
       render();
     };
@@ -4169,6 +5630,95 @@ export async function uiValidatedInput(label: string, current: string, validate:
   }
 }
 
+
+
+// ==================== firewall-panel.ts ====================
+
+const firewallPanelLabels: Record<FirewallResult["status"], string> = {
+  synced: "规则已同步", "needs-update": "规则待更新", "permission-required": "需要管理员权限",
+  inactive: "当前无需本机放行", unsupported: "需要手动处理", blocked: "被系统策略阻止", error: "未完成",
+};
+
+export function firewallPortSummary(rules: FirewallRule[]): string {
+  const ports = [...new Set(rules.map(rule => `${rule.protocol.toUpperCase()} ${rule.port}`))];
+  return ports.length ? ports.join("、") : "无须开放入站端口";
+}
+
+export function printFirewallResult(result: FirewallResult): void {
+  console.log(`防火墙：${firewallPanelLabels[result.status]}${result.backend === "none" ? "" : `（${result.backend}）`}。${result.detail}`);
+  for (const warning of result.warnings) console.log(`防火墙提示：${warning}`);
+}
+
+/** A saved receipt is labeled as such; it never substitutes for an OS policy check. */
+export function firewallPanelSummary(paths: AppPaths, config: AppConfig): string {
+  if (getFirewallSettings(config).mode === "manual") return "防火墙：手动管理（可在防火墙菜单同步或清理规则）";
+  const plan = buildFirewallPlan(paths, config), record = readFirewallRecord(paths);
+  if (!record) return `防火墙：自动管理，应用时检查（${firewallPortSummary(plan.rules)}）`;
+  if (record.fingerprint !== plan.fingerprint) return "防火墙：自动管理，当前节点规则待同步";
+  return `防火墙：自动管理，上次检查：${firewallPanelLabels[record.result.status]}`;
+}
+
+export function requireFirewallApply(result: FirewallResult | null): void {
+  if (result && ["blocked", "error", "permission-required", "needs-update"].includes(result.status)) {
+    throw new Error(`防火墙尚未完成放行，已保留原配置与后台：${result.detail}\n可在“防火墙 / 端口放行”中重试；已有独立防火墙方案时可切换为手动管理。`);
+  }
+}
+
+async function firewallPanelSave(paths: AppPaths, before: AppConfig, settings: FirewallSettings): Promise<void> {
+  const hash = configFingerprint(before), candidate = { ...before, firewall: settings };
+  if (settings.mode === "auto") {
+    const result = await syncFirewallInteractive(paths, candidate, { expectedConfigHash: hash, report: printFirewallResult });
+    requireFirewallApply(result);
+  }
+  if (configFingerprint(readConfig(paths)) !== hash) throw new Error("配置已在另一处修改，请重新打开防火墙设置。");
+  writeConfig(paths, candidate);
+}
+
+async function firewallPanelAdvanced(paths: AppPaths, config: AppConfig): Promise<void> {
+  const settings = getFirewallSettings(config);
+  const backends: FirewallSettings["linuxBackend"][] = ["auto", "ufw", "firewalld", "iptables"];
+  const index = await selectMenu("Linux 防火墙管理器 · 高级", "默认自动识别。只有服务器使用多个管理器或指定网络区域时才需要调整。\n不会启动未启用的防火墙，也不会改变系统默认策略。", ["自动识别（推荐）", "UFW", "firewalld", "iptables / ip6tables", "返回"], backends.indexOf(settings.linuxBackend));
+  if (index === 4) return;
+  settings.linuxBackend = backends[index]!;
+  if (settings.linuxBackend === "firewalld") {
+    settings.firewalldZone = await uiValidatedInput("firewalld 区域名称（留空自动选择；输入 - 清除）", settings.firewalldZone, value => validateFirewallSettings({ ...settings, firewalldZone: value }).firewalldZone, { clearable: true });
+  } else settings.firewalldZone = "";
+  await firewallPanelSave(paths, config, settings);
+  console.log("防火墙设置已保存。节点协议、端口和认证信息保持原值。");
+}
+
+export async function runFirewallPanel(paths: AppPaths): Promise<void> {
+  for (;;) {
+    const config = readConfig(paths), settings = getFirewallSettings(config), plan = buildFirewallPlan(paths, config);
+    const information = [firewallPanelSummary(paths, config), `按已启用直连节点放行：${firewallPortSummary(plan.rules)}`,
+      "使用本机监听端口；仅隧道和回环监听不开放入站端口。",
+      "自动模式在保存并应用、启动及重启时同步，必要时请求 UAC / sudo。",
+      "云服务器安全组、路由器映射及第三方安全软件需在对应位置设置。",
+      ...plan.warnings].join("\n");
+    const options = ["立即检查 / 放行已启用节点端口", settings.mode === "auto" ? "改为手动管理（保留现有规则）" : "开启自动管理（推荐）", "清理本工具规则，并改为手动管理", ...(process.platform === "linux" ? ["高级设置（管理器 / firewalld 区域）"] : []), "返回"];
+    const choice = await selectMenu("防火墙 / 端口放行", information, options);
+    if (choice === options.length - 1) return;
+    try {
+      if (choice === 0) await syncFirewallInteractive(paths, config, { force: true, expectedConfigHash: configFingerprint(config), report: printFirewallResult });
+      else if (choice === 1) {
+        await firewallPanelSave(paths, config, { ...settings, mode: settings.mode === "auto" ? "manual" : "auto" });
+        console.log(settings.mode === "auto" ? "已改为手动管理，现有规则保留。启动、停止及更新节点均不会自动改动防火墙。" : "已开启自动管理。");
+      } else if (choice === 2) {
+        if (await selectMenu("清理 NexusEdge 防火墙规则", "仅删除本安装目录创建的放行规则；你手工设置及其他软件的规则会保留。\n正在运行的直连节点可能失去外部连接，隧道及后台进程继续运行。", ["返回", "清理并改为手动管理"]) === 0) continue;
+        const result = await syncFirewallInteractive(paths, config, { force: true, remove: true, expectedConfigHash: configFingerprint(config), report: printFirewallResult });
+        if (result?.status === "synced") {
+          await firewallPanelSave(paths, config, { ...settings, mode: "manual" });
+          console.log("已改为手动管理，后续启动不会重新创建规则。");
+        }
+      } else await firewallPanelAdvanced(paths, config);
+    } catch (error) {
+      if (error instanceof UiExitRequestedError) throw error;
+      if (error instanceof UserCancelledError) continue;
+      console.log(errorMessage(error));
+    }
+    await uiPause();
+  }
+}
 
 
 // ==================== simple.ts ====================
@@ -4430,7 +5980,7 @@ async function simpleTunnel(node: NodeConfig): Promise<{ node: NodeConfig; prepa
   return { node: next, prepareEncryption, notice };
 }
 
-function simpleSummary(node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
+function simpleSummary(paths: AppPaths, config: AppConfig, node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
   const security = node.tls.mode === "reality" ? `REALITY（目标 ${node.tls.serverName}，密钥已准备）`
     : node.tls.mode === "tls" ? node.tls.certificatePem ? `TLS（已有证书，名称 ${node.tls.serverName}）` : "TLS（保存时自动生成独立证书，无需自备域名）"
     : node.protocol === "vless" ? prepareEncryption ? "ENC（保存时自动生成加密参数）" : node.vlessEncryption !== "none" ? "VLESS ENC" : "无附加 TLS / ENC"
@@ -4443,6 +5993,7 @@ function simpleSummary(node: NodeConfig, existing: boolean, notice: string, prep
     `客户端连接：${endpoint}`, `认证：${existing ? "保留已有凭据" : "已自动生成，可自行修改"}`,
     `安全设置：${security}`, `隧道：${tunnel}；${node.direct ? "直连接入开启" : "直连接入关闭"}`,
     `节点状态：${node.enabled ? "启用" : "停用"}；出口：${node.egress === "direct" ? "本机网络" : "WARP"}`,
+    getFirewallSettings(config).mode === "auto" ? `本机防火墙：应用时自动同步（${firewallPortSummary(buildFirewallPlan(paths, { ...config, nodes: [node] }).rules)}；需要时请求管理员授权）` : "本机防火墙：手动管理（可在主菜单开启自动放行）",
     ...(node.tunnel.mode === "fixed" ? [`Cloudflare 映射：${node.tunnel.domain} → http://${fixedOrigin.includes(":") ? `[${fixedOrigin}]` : fixedOrigin}:${node.port}`] : []),
     directListenerNotice(node), notice,
     "默认直接保存即可；只有自定义需求才需要高级配置。应用会重启当前后台，共享核心上的节点会短暂重连。",
@@ -4469,7 +6020,7 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
   for (;;) {
     const items = ["apply", "save", ...(["vless", "vmess"].includes(node.protocol) ? ["tunnel"] : []), "address", "auth", "advanced", "cancel"];
     const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: "名称与 UUID / 密码", advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
-    const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
+    const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(paths, config, node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
     if (selected === "cancel") throw new UserCancelledError();
     try {
       if (selected === "tunnel") {
@@ -5033,7 +6584,11 @@ async function panelReadiness(paths: AppPaths): Promise<void> {
     for (const link of node.links) console.log(`${link.label}：${link.error || link.uri || "请从导出菜单取得客户端 JSON"}`);
     if (node.lastError) console.log(node.lastError);
   }
-  console.log("\n就绪检查确认本机监听及所选隧道连接。直连的公网端口 / NAT / 防火墙和客户端实际访问仍需现场验证。");
+  if (status.firewall) {
+    console.log(`\n后台防火墙检查（${status.firewall.backend} / ${status.firewall.status}）：${status.firewall.detail}`);
+    for (const warning of status.firewall.warnings) console.log(`防火墙提示：${warning}`);
+  }
+  console.log("\n就绪检查确认本机监听及所选隧道连接。云安全组、路由器 NAT、第三方安全软件和客户端实际访问仍需现场验证。");
   console.log("关闭面板后后台继续运行；部分节点未就绪时，其他已就绪节点可以继续使用。");
 }
 
@@ -5041,23 +6596,67 @@ async function panelStop(paths: AppPaths, startup: StartupStatus): Promise<void>
   if (startup.mode !== "none") await stopManaged(paths); else await stopDaemonGracefully(paths);
 }
 
-async function panelApplyConfiguration(paths: AppPaths, candidate: AppConfig): Promise<void> {
-  const current = await getDaemonStatus(paths);
-  if (panelRuntimeMatches(current, candidate, paths)) {
-    writeConfig(paths, candidate);
+export interface PanelRuntimeOperations {
+  getStatus: typeof getDaemonStatus;
+  prepare: typeof prepareRuntime;
+  syncFirewall: typeof syncFirewallInteractive;
+  getStartup: typeof getStartupStatus;
+  stop: typeof panelStop;
+  start: (paths: AppPaths, startup: StartupStatus) => Promise<void>;
+  readiness: typeof panelReadiness;
+  save: typeof writeConfig;
+}
+
+const panelRuntimeDefaults: PanelRuntimeOperations = {
+  getStatus: getDaemonStatus, prepare: prepareRuntime, syncFirewall: syncFirewallInteractive,
+  getStartup: getStartupStatus, stop: panelStop, readiness: panelReadiness, save: writeConfig,
+  start: async (paths, startup) => { if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths); },
+};
+
+/** Preflight and UAC run before the saved configuration or existing worker changes. */
+export async function panelApplyConfiguration(paths: AppPaths, input: AppConfig, options: { forceRestart?: boolean } = {}, overrides: Partial<PanelRuntimeOperations> = {}): Promise<void> {
+  const operations = { ...panelRuntimeDefaults, ...overrides };
+  const candidate = validateConfig(input, { allowExpiredCertificate: true });
+  const previous = readConfig(paths), expected = configFingerprint(previous);
+  const current = await operations.getStatus(paths);
+  const unchanged = !options.forceRestart && panelRuntimeMatches(current, candidate, paths);
+  if (!unchanged && candidate.nodes.some(node => node.enabled)) await operations.prepare(paths, candidate);
+  const firewall = await operations.syncFirewall(paths, candidate, { expectedConfigHash: expected, report: printFirewallResult });
+  requireFirewallApply(firewall);
+  if (configFingerprint(readConfig(paths)) !== expected) throw new Error("配置在准备过程中被修改，未覆盖新配置或停止原后台。请重新打开节点后应用。");
+  try { operations.save(paths, candidate); }
+  catch (error) {
+    if (firewall?.changed) {
+      try {
+        const restored = await operations.syncFirewall(paths, previous, { force: true, expectedConfigHash: expected, report: printFirewallResult });
+        if (restored && !["synced", "inactive"].includes(restored.status)) console.log("旧端口规则未完全恢复，请从防火墙菜单重新同步。");
+      } catch (restoreError) { console.log(`旧端口规则恢复未完成：${errorMessage(restoreError)}`); }
+    }
+    throw error;
+  }
+  if (unchanged) {
     console.log("配置已保存。服务端参数保持一致，后台继续运行；链接地址会自动刷新。");
     return;
   }
-  if (candidate.nodes.some(node => node.enabled)) await prepareRuntime(paths, candidate);
-  writeConfig(paths, candidate);
   try {
-    const startup = await getStartupStatus(paths);
-    await panelStop(paths, startup);
+    const startup = await operations.getStartup(paths);
+    await operations.stop(paths, startup);
     if (!candidate.nodes.some(node => node.enabled)) { console.log("已保存停用状态，并停止后台节点。"); return; }
-    if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths);
-    await panelReadiness(paths);
+    await operations.start(paths, startup);
+    await operations.readiness(paths);
   } catch (error) {
     console.log(`配置已保存，但后台应用未完成：${errorMessage(error)}\n处理后可从主菜单选择“启动 / 重启全部节点”重试。`);
+  }
+}
+
+/** Explicit stop removes owned rules after the worker stops; restart/update use panelStop directly. */
+export async function panelStopAll(paths: AppPaths, startup: StartupStatus, overrides: Partial<PanelRuntimeOperations> = {}): Promise<void> {
+  const operations = { ...panelRuntimeDefaults, ...overrides }, config = readConfig(paths);
+  await operations.stop(paths, startup);
+  console.log("后台及各节点核心已停止，自动启动设置保持不变。");
+  if (getFirewallSettings(config).mode === "auto") {
+    try { await operations.syncFirewall(paths, config, { remove: true, expectedConfigHash: configFingerprint(config), report: printFirewallResult }); }
+    catch (error) { console.log(`后台已停止；防火墙规则清理未完成：${errorMessage(error)}\n可从防火墙菜单重新清理。`); }
   }
 }
 
@@ -5065,11 +6664,13 @@ async function panelStartup(paths: AppPaths, current: StartupStatus): Promise<bo
   if (current.enabled) { await disableStartup(paths); console.log("自动启动已关闭，当前后台继续运行。需要停止时请选择停止全部节点。"); return false; }
   await prepareRuntime(paths);
   if (isSystemInstallation(paths)) {
+    requireFirewallApply(await syncFirewallInteractive(paths, readConfig(paths), { report: printFirewallResult }));
     await enableStartup(paths, "system"); await startManaged(paths); await panelReadiness(paths); return false;
   }
   const mode = process.platform === "win32" ? await selectMenu("自动启动模式", "系统模式会安装到受保护目录，需要时请求 UAC。用户模式只在该用户登录后运行。", ["系统开机启动（SYSTEM，无需登录）", "当前用户登录后启动", "取消"]) : await selectMenu("启用系统自启", "需要 systemd，程序将安装到 /opt/nexus-edge；必要时请求 sudo。", ["启用系统自启", "取消"]);
   if ((process.platform === "win32" && mode === 2) || (process.platform !== "win32" && mode === 1)) return false;
   if (mode === 1 && process.platform === "win32") {
+    requireFirewallApply(await syncFirewallInteractive(paths, readConfig(paths), { report: printFirewallResult }));
     await panelStop(paths, current); await enableStartup(paths, "user"); await startManaged(paths); await panelReadiness(paths); return false;
   }
   const requestId = panelCrypto.randomUUID();
@@ -5095,20 +6696,25 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       `后台：${status?.phase ?? "未运行"}    权限：${admin ? "管理员 / root" : "普通用户"}`,
       `节点：${config.nodes.length} 个（${enabled.length} 个启用）    隧道：${enabled.filter(node => node.tunnel.mode !== "none").length} 个`,
       `自启：${startup.detail}`, `数据：${paths.data}`,
+      firewallPanelSummary(paths, config),
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "退出面板（保留后台）"]);
-    if (choice === 8) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "防火墙 / 端口放行", "退出面板（保留后台）"]);
+    if (choice === 9) return "exit";
     try {
-      if (choice === 0) { await prepareRuntime(paths); await panelStop(paths, startup); if (startup.mode !== "none") await startManaged(paths); else await startDetachedDaemon(paths); await panelReadiness(paths); }
-      else if (choice === 1) { await panelStop(paths, startup); console.log("后台及各节点核心已停止，自动启动设置保持不变。"); }
+      if (choice === 0) {
+        if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
+        await panelApplyConfiguration(paths, config, { forceRestart: true });
+      }
+      else if (choice === 1) await panelStopAll(paths, startup);
       else if (choice === 2) { await panelManageNodes(paths); continue; }
       else if (choice === 3) { await panelExport(paths); continue; }
       else if (choice === 4) await panelSharedSettings(paths);
       else if (choice === 5) console.log(tailLog(paths));
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
+      else if (choice === 8) { await runFirewallPanel(paths); continue; }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;
@@ -5125,7 +6731,7 @@ import * as mainPath from "node:path";
 
 export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -5133,6 +6739,10 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   const version = Bun.version.split(".").map(Number);
   if ((version[0] ?? 0) < 1 || (version[0] === 1 && ((version[1] ?? 0) < 4 || (version[1] === 4 && (version[2] ?? 0) < 3)))) throw new Error("请使用 Bun 1.4.3 或更新版本。");
   const paths = createPaths(entry);
+  if (args[0] === "--firewall-request") {
+    if (args.length !== 2) throw new Error("防火墙辅助程序需要有效的单次请求 ID。");
+    return runFirewallRequest(paths, args[1]!);
+  }
   if (args[0] === "--core-host") return runCoreHost(args[1] ?? "", args.slice(2));
   if (args[0] === "--worker") { await runDaemonWorker(paths); return 0; }
   if (args[0] === "--stop-worker") { await stopDaemonGracefully(paths); return 0; }

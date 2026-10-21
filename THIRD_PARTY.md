@@ -1,6 +1,6 @@
 # Third-party components and references
 
-NexusEdge 2.2.1 launches upstream cores as separate processes. This source
+NexusEdge 2.3.0 launches upstream cores as separate processes. This source
 archive contains no Bun, Xray, sing-box, cloudflared, or libcronet binaries.
 First-use defaults have pinned official URLs, archive hashes, and extracted file
 hashes in `src/network.ts`. Explicit updates query the same official repositories
@@ -50,14 +50,28 @@ valid WireGuard profiles can be imported instead.
 
 Protocol and feature references:
 
-- Original requirement context: <https://github.com/yonggekkk/argosbx>
-- Simple preset / optional-field reference: <https://yonggekkk.github.io/argosbx/>
 - Xray VLESS: <https://xtls.github.io/config/inbounds/vless.html>
 - Xray TLS / REALITY: <https://xtls.github.io/config/transport.html>
 - sing-box configuration: <https://sing-box.sagernet.org/configuration/>
 - Shadowsocks SIP002: <https://shadowsocks.org/doc/sip002.html>
 - Cloudflare Tunnel: <https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/>
 - Quick Tunnel: <https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/>
+
+Operating-system firewall interfaces used by the controller:
+
+- Microsoft NetSecurity / New-NetFirewallRule: <https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule>
+- Windows Firewall rule behavior and policy: <https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules>
+- UFW manual: <https://manpages.ubuntu.com/manpages/resolute/man8/ufw.8.html>
+- firewalld rich rules: <https://firewalld.org/documentation/man-pages/firewalld.richlanguage.html>
+- firewalld runtime and permanent configuration: <https://firewalld.org/documentation/configuration/runtime-versus-permanent.html>
+- Netfilter iptables: <https://man7.org/linux/man-pages/man8/iptables.8.html>
+- nftables chain verdict semantics: <https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains>
+
+Firewall rules manage finite local inbound ports, separately from protocol cores.
+No firewall binaries are redistributed. The controller preserves unrelated rules,
+does not enable a disabled firewall, and does not change cloud security groups or
+router NAT. Tests substitute OS command execution; native Windows policy and
+remote reachability require validation on the target machine.
 
 The optional public-address lookup sends credential-free HTTPS requests to
 fixed ipify, AWS CheckIP and Cloudflare trace endpoints. Documentation:
@@ -72,5 +86,5 @@ The lookup reports an outbound address candidate, not an inbound reachability
 guarantee. System VPN/TUN routes can still affect it. No node credentials,
 tokens, certificate material or application configuration are sent.
 
-NexusEdge is an independent controller written for the user's requirements. It
-is not the upstream Argosbx project or an official distribution of these cores.
+NexusEdge is an independent controller. The core projects maintain their own
+releases, licenses, and support channels.
