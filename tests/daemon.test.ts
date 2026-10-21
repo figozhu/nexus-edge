@@ -97,6 +97,28 @@ function startWorker(env: Environment): ChildProcess {
   return child;
 }
 
+test("firewall diagnostics use the installation scope and remain separate from local listener readiness", async () => {
+  const env = await environment({ protocol: "shadowsocks" });
+  writeFileSync(join(env.root, "firewall-fixture.json"), "{}");
+  startWorker(env);
+  const status = await until(() => getDaemonStatus(env.paths), current => current?.phase === "ready");
+  expect(status!.firewall).toEqual({ status: "blocked", backend: "windows", detail: "Synthetic blocked firewall", warnings: ["Synthetic policy warning"] });
+  const observed = JSON.parse(readFileSync(join(env.root, "firewall-observed.jsonl"), "utf8"));
+  expect(observed).toEqual({ root: env.paths.root, data: env.paths.data });
+  expect(status!.nodes[0]!.listenerReady).toBe(true);
+  expect(readFileSync(env.paths.log, "utf8")).toContain("Synthetic policy warning");
+});
+
+test("an unexpected firewall backend failure is logged while the local core still becomes ready", async () => {
+  const env = await environment({ protocol: "shadowsocks" });
+  writeFileSync(join(env.root, "firewall-fixture.json"), JSON.stringify({ throw: true }));
+  startWorker(env);
+  const status = await until(() => getDaemonStatus(env.paths), current => current?.phase === "ready");
+  expect(status!.firewall?.status).toBe("error");
+  expect(status!.firewall?.detail).toContain("Synthetic firewall exception");
+  expect(status!.nodes[0]!.listenerReady).toBe(true);
+});
+
 function events(env: Environment): MockEvent[] {
   const filename = join(env.root, "events.jsonl");
   if (!existsSync(filename)) return [];

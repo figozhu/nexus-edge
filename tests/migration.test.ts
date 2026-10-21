@@ -117,6 +117,60 @@ function before(events: string[], first: string, second: string): void {
 }
 
 describe("system installation migration with injected operations", () => {
+  test("prepares target firewall ownership before stopping source and cleans source only after activation", async () => {
+    const s = scenario();
+    s.operations.prepareFirewall = async (source, target) => {
+      expect(source).toBe(s.source); expect(target).toBe(s.target); expect(s.state.sourceRunning).toBe(true);
+      s.events.push("firewall:prepare");
+      return {
+        rollback: async () => { s.events.push("firewall:rollback"); },
+        complete: async () => { expect(s.state.active).toBe(true); expect(s.state.targetRunning).toBe(true); s.events.push("firewall:complete"); },
+      };
+    };
+    await migrateSystemInstallation(s.source, s.operations);
+    before(s.events, "preflight:target", "firewall:prepare");
+    before(s.events, "firewall:prepare", "stopPortable:source");
+    before(s.events, "activate:target", "firewall:complete");
+    expect(s.events).not.toContain("firewall:rollback");
+  });
+
+  test("failed target startup restores source firewall ownership before restarting source", async () => {
+    const s = scenario({ faults: [{ step: "startManaged:target", afterEffect: true }] });
+    s.operations.prepareFirewall = async () => ({
+      rollback: async () => { expect(s.state.targetRunning).toBe(false); s.events.push("firewall:rollback"); },
+      complete: async () => { s.events.push("firewall:complete"); },
+    });
+    await expect(migrateSystemInstallation(s.source, s.operations)).rejects.toThrow("startManaged:target");
+    before(s.events, "stopManaged:target", "firewall:rollback");
+    before(s.events, "firewall:rollback", "startPortable:source");
+    expect(s.events).not.toContain("firewall:complete");
+  });
+
+  test("does not remove target rules while a failed target cannot be safely stopped", async () => {
+    const s = scenario({ faults: [{ step: "startManaged:target", afterEffect: true }, { step: "stopManaged:target" }] });
+    s.operations.prepareFirewall = async () => ({ rollback: async () => { s.events.push("firewall:rollback"); }, complete: async () => {} });
+    await expect(migrateSystemInstallation(s.source, s.operations)).rejects.toThrow("系统副本停止失败");
+    expect(s.events).not.toContain("firewall:rollback"); expect(s.events).not.toContain("startPortable:source");
+  });
+
+  test("a blocked firewall preparation never stops the existing source", async () => {
+    const s = scenario();
+    s.operations.prepareFirewall = async () => { throw new Error("Firewall policy blocks migration"); };
+    await expect(migrateSystemInstallation(s.source, s.operations)).rejects.toThrow("Firewall policy blocks migration");
+    expect(s.events).not.toContain("stopPortable:source"); expect(s.state.sourceRunning).toBe(true);
+  });
+
+  test("source-rule cleanup failure leaves the ready target active", async () => {
+    const s = scenario();
+    s.operations.prepareFirewall = async () => ({
+      rollback: async () => { s.events.push("firewall:rollback"); },
+      complete: async () => { throw new Error("Old rule cleanup failed"); },
+    });
+    expect(await migrateSystemInstallation(s.source, s.operations)).toBe(s.target);
+    expect(s.state.active).toBe(true); expect(s.state.targetRunning).toBe(true);
+    expect(s.events).not.toContain("firewall:rollback");
+  });
+
   test("validates a copy before stopping the portable source and activates only a ready target", async () => {
     const s = scenario();
     const result = await migrateSystemInstallation(s.source, s.operations);

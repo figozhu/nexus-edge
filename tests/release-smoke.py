@@ -40,10 +40,13 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
     entry = script_dir / "nexus-edge.ts"
     shutil.copyfile(source, entry)
     version = subprocess.run([bun, str(entry), "--version"], cwd=work_dir, capture_output=True, text=True, check=True)
-    assert version.stdout.strip() == "2.2.1", version.stdout
+    assert version.stdout.strip() == "2.3.0", version.stdout
     help_result = subprocess.run([bun, str(entry), "--help"], cwd=work_dir, capture_output=True, text=True, check=True)
     assert "隧道按节点可选" in help_result.stdout and "Shadowsocks" not in help_result.stderr
     assert not (script_dir / ".nexus-edge").exists(), "Help/version should not initialize configuration"
+    bad_helper = subprocess.run([bun, str(entry), "--firewall-request", "../escape"], cwd=work_dir, capture_output=True, text=True)
+    assert bad_helper.returncode != 0, "Invalid firewall helper request was accepted"
+    assert not (script_dir / ".nexus-edge").exists(), "Invalid helper must not initialize configuration or a firewall"
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
     original = termios.tcgetattr(slave)
@@ -82,7 +85,26 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
                 raise AssertionError(output.decode("utf-8", errors="replace"))
             if select.select([master], [], [], 0.1)[0]:
                 output.extend(os.read(master, 65536))
+        checkpoint = len(output)
         os.write(master, b"9")
+        deadline = time.monotonic() + 10
+        firewall_marker = "立即检查 / 放行已启用节点端口".encode()
+        while firewall_marker not in output[checkpoint:]:
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError(output.decode("utf-8", errors="replace"))
+            if select.select([master], [], [], 0.1)[0]:
+                output.extend(os.read(master, 65536))
+        assert "自动管理".encode() in output[checkpoint:]
+        assert "无须开放入站端口".encode() in output[checkpoint:]
+        checkpoint = len(output)
+        os.write(master, b"\x1b")
+        deadline = time.monotonic() + 10
+        while marker not in output[checkpoint:]:
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError(output.decode("utf-8", errors="replace"))
+            if select.select([master], [], [], 0.1)[0]:
+                output.extend(os.read(master, 65536))
+        os.write(master, b"0")
         process.wait(timeout=5)
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == original, "Terminal mode was not restored"
@@ -90,9 +112,10 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
         config = json.loads((data / "config.json").read_text())
         assert config == {"schema": 2, "nodes": [], "webhook": {"kind": "none", "url": ""}}, config
         assert not (data / "runtime.json").exists() and not (data / "node-link.txt").exists()
+        assert not (data / "firewall-state.json").exists() and not (data / "firewall-linux-state.json").exists()
         assert not (data / "bin").exists() or not list((data / "bin").iterdir())
         assert not list(work_dir.iterdir()), "Application used cwd instead of the script directory"
-        print("PASS generated single file: help/version, Unicode paths, read-only core menu, empty default, no tunnel/core, clean PTY exit")
+        print("PASS generated single file: help/version, invalid firewall helper, Unicode paths, read-only core/firewall menus, empty default, no firewall changes, clean PTY exit")
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)
