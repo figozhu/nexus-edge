@@ -1,0 +1,6 @@
+node_modules/
+.nexus-edge/
+installation.json
+*.log
+__pycache__/
+*.py[cod]

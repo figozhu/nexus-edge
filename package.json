@@ -1,0 +1,16 @@
+{
+  "name": "nexus-edge",
+  "version": "2.2.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Cross-platform multi-protocol sing-box/Xray node manager with optional Cloudflare tunnels",
+  "scripts": {
+    "start": "bun nexus-edge.ts",
+    "build": "bun scripts/build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": { "bun": ">=1.4.3" },
+  "devDependencies": { "@types/bun": "1.4.3", "typescript": "5.9.3" }
+}
