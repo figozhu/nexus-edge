@@ -6,7 +6,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.0";
+export const APP_VERSION = "2.3.1";
 
 export interface WarpProfile {
   privateKey: string;
@@ -74,6 +74,8 @@ export interface FirewallSettings {
 
 export interface AppConfig {
   schema: 2;
+  /** 核心出站是否允许 IPv6；旧配置未设置时按 false 处理，不改变已有入站监听。 */
+  coreIpv6?: boolean;
   nodes: NodeConfig[];
   warp?: WarpProfile;
   webhook: { kind: "none" | "generic" | "feishu" | "wecom" | "dingtalk" | "bark"; url: string };
@@ -182,7 +184,8 @@ export function ensureDataDir(paths: AppPaths): void {
     if (coreFs.existsSync(markerPath)) {
       const marker = JSON.parse(coreFs.readFileSync(markerPath, "utf8")) as { app?: string; schema?: number; entry?: string; runtime?: string };
       if (marker.app === "NexusEdge" && marker.schema === 1 && typeof marker.entry === "string" && corePath.resolve(marker.entry).toLowerCase() === paths.entry.toLowerCase()) {
-        const script = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)";
+        // 只允许 Windows PowerShell 自带模块，避免继承 PowerShell 7 的模块目录。
+        const script = "$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules'); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)";
         const query = coreCp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true, timeout: 20000 });
         const programData = query.stdout?.trim().replace(/^\uFEFF/, "");
         if (query.status === 0 && programData && corePath.win32.resolve(paths.root).toLowerCase() === corePath.win32.join(programData, "NexusEdge").toLowerCase()) {
@@ -522,6 +525,13 @@ export function getFirewallSettings(config: AppConfig): FirewallSettings {
   return config.firewall === undefined ? { mode: "auto", linuxBackend: "auto", firewalldZone: "" } : validateFirewallSettings(config.firewall);
 }
 
+/**
+ * 读取核心出站 IPv6 开关。
+ * @param config 应用配置；缺省字段兼容旧版配置，默认禁用。
+ * @returns 仅显式 true 时允许核心使用 IPv6 出站。
+ */
+export function isCoreIpv6Enabled(config: AppConfig): boolean { return config.coreIpv6 === true; }
+
 function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
   if (a.port !== b.port || !nodeListenNetworks(a).some(network => nodeListenNetworks(b).includes(network))) return false;
   if (a.listen === b.listen || a.listen === "::" || b.listen === "::") return true;
@@ -531,6 +541,7 @@ function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
 
 export function validateConfig(value: unknown, options: { allowExpiredCertificate?: boolean } = {}): AppConfig {
   const v = coreObject(value, "配置");
+  if (v.coreIpv6 !== undefined && typeof v.coreIpv6 !== "boolean") throw new Error("核心 IPv6 开关必须为 true 或 false。");
   if (v.schema !== 2) throw new Error("不支持此配置版本；请通过 readConfig 升级旧配置，并保留原文件。");
   if (!Array.isArray(v.nodes) || v.nodes.length > 32) throw new Error("nodes 必须是最多 32 个节点的数组。");
   const nodes = v.nodes.map(node => validateNode(node, options));
@@ -542,7 +553,7 @@ export function validateConfig(value: unknown, options: { allowExpiredCertificat
   }
   const warp = v.warp === undefined ? undefined : validateWarpProfile(v.warp);
   if (!warp && nodes.some(node => node.enabled && node.egress === "warp")) throw new Error("已启用的节点选择了 WARP 出站，但尚未配置有效的 WARP 凭据。");
-  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
+  return { schema: 2, nodes, ...(v.coreIpv6 === undefined ? {} : { coreIpv6: v.coreIpv6 }), ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
 }
 
 /** Convert only the released v1 shape; never reinterpret damaged legacy data. */
@@ -639,9 +650,11 @@ export function configFingerprint(config: AppConfig): string {
  * Keep every other field, including node names and shared settings, conservative. */
 export function runtimeConfigFingerprint(config: AppConfig): string {
   const normalized = validateConfig(config, { allowExpiredCertificate: true });
-  const { firewall: _firewall, ...coreSettings } = normalized;
+  const { firewall: _firewall, coreIpv6: _coreIpv6, ...coreSettings } = normalized;
   const runtimeConfig = {
     ...coreSettings,
+    // 有效默认值必须进入指纹：升级前的双栈 worker 不能被误认为已应用新的 IPv4 默认策略。
+    coreIpv6: isCoreIpv6Enabled(normalized),
     nodes: normalized.nodes.map(({ address: _address, publicPort: _publicPort, ...node }) => node),
   };
   return coreCrypto.createHash("sha256").update(JSON.stringify(runtimeConfig)).digest("hex");

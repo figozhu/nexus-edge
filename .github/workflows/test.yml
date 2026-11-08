@@ -1,0 +1,49 @@
+name: 跨平台测试
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Bun 1.4.4
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7.0.1
+      - name: 安装固定 Bun 版本
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: 安装锁定依赖
+        run: bun install --frozen-lockfile
+      - name: 构建单文件
+        run: bun run build
+      - name: 检查类型
+        run: bun run typecheck
+      - name: 运行单元和本机进程测试
+        run: bun test
+      # 脚本自行创建独立 net/mount namespace，并核对宿主 sysctl 与配置未变。
+      # 只对隔离回环接口操作；持久化目录为私有 tmpfs，不修改 runner 的网卡。
+      - name: 验证 Linux IPv6 真实内核开关与持久化配置
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo "$(command -v bun)" tests/fixtures/ipv6-linux-namespace.ts
+      # PTY 需要 POSIX 终端；Linux 防火墙测试也在此平台验证真实文件权限与锁语义。
+      - name: 验证 Linux 交互菜单与单文件发布
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 tests/ui-pty.py --bun "$(command -v bun)"
+          python3 tests/panel-pty.py --bun "$(command -v bun)"
+          python3 tests/simple-pty.py --bun "$(command -v bun)"
+          python3 tests/release-smoke.py --bun "$(command -v bun)"

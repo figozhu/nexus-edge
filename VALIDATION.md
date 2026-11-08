@@ -1,3 +1,42 @@
+# NexusEdge 2.3.1 验证报告
+
+验证日期：2026-11-08。当前开发与现场环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3；下方 2.3.0 报告属于历史记录，不计入本次结果。
+
+## 验证范围
+
+- 新旧配置的核心 IPv6 默认关闭、显式双栈开关、运行指纹和凭据保留。
+- sing-box / Xray 实际回环 IPv4 转发、只查询 A 记录、默认阻断 IPv6 字面量及开启后 IPv6 转发；两种设置下的 REALITY / WARP 官方配置预检。
+- Windows / Linux 接口状态、切换、持久化、权限、取消与部分失败回滚。Windows 使用真实 PowerShell 解析脚本和模拟 NetAdapter provider，本机网卡只做只读检查。
+- 真实 Windows PowerShell 5.1 在继承不兼容模块目录时的故障复现与修复；真实用户登录任务、SYSTEM 开机任务注册和运行，测试任务在 finally 中清理。
+- 跨平台构建、类型检查、单元/进程测试，以及 Linux PTY 菜单和单文件发布冒烟。
+
+未进行公网 WARP / Cloudflare 隧道端到端验证，也未为了测试改变开发机器的 IPv6 接口。SYSTEM 任务实测运行不等同于重启整台机器后的验收。
+
+## 重跑方法
+
+```powershell
+bun install --frozen-lockfile
+bun run build
+bun run typecheck
+bun test
+
+# 仅 Windows：临时真实任务将自动注销，不替换 NexusEdge-System。
+$env:NEXUS_PLATFORM_WINDOWS_INTEGRATION = '1'
+bun test tests/platform-windows.test.ts
+```
+
+真实核心测试需提供与 `NETWORK_RELEASES` 固定清单匹配的官方二进制：
+
+```powershell
+$env:NEXUS_EDGE_SINGBOX_TEST_BINARY = 'C:\path\to\sing-box.exe'
+$env:NEXUS_EDGE_XRAY_TEST_BINARY = 'C:\path\to\xray.exe'
+bun test tests/network.test.ts tests/real-proxy.test.ts tests/core-ipv6-real.test.ts
+```
+
+跨平台自动测试见 `.github/workflows/test.yml`。Linux 防火墙文件权限与锁测试只在 Linux 运行，Windows 的 POSIX 跳过不代表覆盖已通过。样本缺失导致的跳过数应与通过数分别报告。
+
+---
+
 # NexusEdge 2.3.0 验证报告
 
 验证日期：2026-10-21。对象：模块源码、测试及由 `scripts/build.ts` 生成的单文件 `nexus-edge.ts`。

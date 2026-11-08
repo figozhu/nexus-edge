@@ -1,0 +1,3 @@
+# 统一发布文本换行，保证 Windows / Linux 构建与校验清单一致。
+* text=auto eol=lf
+*.cmd -text

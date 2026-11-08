@@ -67,6 +67,7 @@ describe("independent multi-node engines and routing", () => {
   });
   test("WARP selection is per-node, user-mode, and has separate target/peer DNS", () => {
     const config = networkTestConfig("vless", "vmess", "shadowsocks"); config.warp = networkTestProfile;
+    config.coreIpv6 = true;
     config.nodes[0]!.egress = "warp"; config.nodes[1]!.egress = "warp";
     const sing = buildSingBoxConfig(config) as any, xray = buildXrayConfig(config) as any;
     expect(sing.endpoints[0].system).toBe(false);

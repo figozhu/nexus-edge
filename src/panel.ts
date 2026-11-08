@@ -11,6 +11,8 @@ import { configureSimpleNode, editConnectionAddress, repairNodeAddress, directLi
 import { getFirewallSettings } from "./core.ts";
 import { syncFirewallInteractive } from "./firewall-control.ts";
 import { firewallPanelSummary, printFirewallResult, requireFirewallApply, runFirewallPanel } from "./firewall-panel.ts";
+import { isCoreIpv6Enabled } from "./core.ts";
+import { runHostIpv6Panel } from "./ipv6-panel.ts";
 
 const panelProtocolLabels: Record<NodeProtocol, string> = {
   vless: "VLESS", vmess: "VMess", shadowsocks: "Shadowsocks / SS2022", trojan: "Trojan",
@@ -478,6 +480,37 @@ async function panelStartup(paths: AppPaths, current: StartupStatus): Promise<bo
   return true;
 }
 
+/**
+ * 编辑核心出站 IPv6 策略，参数 paths 为当前安装路径，无返回值。
+ * 保存前核对配置指纹；立即应用复用核心预检流程，失败时保留旧配置和后台。
+ */
+async function panelCoreIpv6Settings(paths: AppPaths): Promise<void> {
+  const config = readConfig(paths), expected = configFingerprint(config);
+  const enabled = isCoreIpv6Enabled(config);
+  const choice = await selectMenu("核心出站 IPv6", `当前：${enabled ? "已开启（双栈）" : "已禁用（仅 IPv4，默认）"}。\n控制 sing-box / Xray 的 DNS、直连与 WARP 出站，以及 cloudflared 边缘连接。\n已有节点监听地址保持原值；本机网卡 IPv6 在独立菜单设置。`, ["禁用 IPv6（仅 IPv4）", "开启 IPv6（双栈）", "返回"], enabled ? 1 : 0);
+  if (choice === 2 || (choice === 1) === enabled) return;
+  const action = await selectMenu("应用核心 IPv6 设置", "立即应用会先检查核心配置，再重启节点；仅保存则在下次启动 / 重启时生效。", ["保存并应用", "仅保存，稍后重启", "取消"]);
+  if (action === 2) return;
+  if (configFingerprint(readConfig(paths)) !== expected) throw new Error("配置已在另一处修改，请重新打开核心 IPv6 设置。");
+  const candidate = { ...config, coreIpv6: choice === 1 };
+  if (action === 0 && candidate.nodes.some(node => node.enabled)) await panelApplyConfiguration(paths, candidate);
+  else {
+    writeConfig(paths, candidate);
+    console.log("核心 IPv6 设置已保存，下次启动 / 重启节点时生效。");
+  }
+}
+
+/** 网络设置子菜单；paths 指向当前安装，无返回值，系统接口操作独立于核心策略。 */
+async function panelNetworkSettings(paths: AppPaths): Promise<void> {
+  for (;;) {
+    const choice = await selectMenu("IPv6 / 防火墙设置", `核心出站 IPv6：${isCoreIpv6Enabled(readConfig(paths)) ? "已开启" : "已禁用（默认）"}`, ["核心出站 IPv6（开启 / 禁用）", "本机 IPv6 网络接口（开启 / 禁用）", "防火墙 / 端口放行", "返回"]);
+    if (choice === 3) return;
+    if (choice === 0) { await panelCoreIpv6Settings(paths); await uiPause(); }
+    else if (choice === 1) await runHostIpv6Panel(paths);
+    else await runFirewallPanel(paths);
+  }
+}
+
 export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
   if (!process.stdin.isTTY) throw new Error("管理面板需要交互式 PowerShell / cmd / Windows Terminal / Linux 终端。");
   for (;;) {
@@ -490,10 +523,11 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       `节点：${config.nodes.length} 个（${enabled.length} 个启用）    隧道：${enabled.filter(node => node.tunnel.mode !== "none").length} 个`,
       `自启：${startup.detail}`, `数据：${paths.data}`,
       firewallPanelSummary(paths, config),
+      `核心出站 IPv6：${isCoreIpv6Enabled(config) ? "已开启" : "已禁用（默认）"}`,
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "防火墙 / 端口放行", "退出面板（保留后台）"]);
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "退出面板（保留后台）"]);
     if (choice === 9) return "exit";
     try {
       if (choice === 0) {
@@ -507,7 +541,7 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       else if (choice === 5) console.log(tailLog(paths));
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
-      else if (choice === 8) { await runFirewallPanel(paths); continue; }
+      else if (choice === 8) { await panelNetworkSettings(paths); continue; }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;

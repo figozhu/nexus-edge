@@ -58,11 +58,24 @@ function platformPowerShellPayload(value: unknown): string {
   return `$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(JSON.stringify(value), "utf8").toString("base64")}')) | ConvertFrom-Json;\n`;
 }
 
+/**
+ * 包装在 Windows PowerShell 5.1 中执行的系统脚本。
+ * @param script 已由调用方构建的脚本；路径等外部输入必须通过 JSON 载荷传递。
+ * @returns 仅使用该解释器系统模块目录、统一 UTF-8 输出和异常退出码的完整脚本。
+ * Bun 从 PowerShell 7 启动时会继承其 PSModulePath，5.1 自动加载同名模块将失败。
+ * 因此必须在任何可能自动加载模块的命令之前设置子进程内的模块路径；不修改用户或系统环境。
+ */
 function platformPowerShellProgram(script: string): string {
-  return `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\ntry {\n${script}\n} catch {\n [Console]::Error.WriteLine($_.Exception.Message)\n exit 1\n}\n`;
+  return `$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\ntry {\n${script}\n} catch {\n [Console]::Error.WriteLine($_.Exception.Message)\n exit 1\n}\n`;
 }
 
-async function platformPowerShell(script: string, timeoutMs = 60000): Promise<string> {
+/**
+ * 在隐藏的 Windows PowerShell 5.1 子进程中执行受控系统操作。
+ * @param script 受控脚本字符串；勿直接拼接用户输入，应使用 JSON/Base64 载荷。
+ * @param timeoutMs 超时毫秒数，默认 60 秒；超时或非零退出码会抛出含上下文的异常。
+ * @returns 去除首尾空白及 BOM 的 UTF-8 标准输出。
+ */
+export async function platformPowerShell(script: string, timeoutMs = 60000): Promise<string> {
   const result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { timeoutMs });
   return platformRequireSuccess(result, "Windows 系统操作");
 }
@@ -212,20 +225,30 @@ function platformAssertStandaloneEntry(paths: AppPaths): void {
   if (/\b(?:from\s*|import\s*\(\s*|require\s*\(\s*)["']\.{1,2}\//.test(source) || /\bimport\s*["']\.{1,2}\//.test(source)) throw new Error("入口仍包含相对模块依赖，请使用构建后的完整单文件 nexus-edge.ts。");
 }
 
+/**
+ * 为 Windows UAC 构建提权脚本，并按是否打开交互面板选择窗口可见性。
+ * @param paths 已校验的单文件入口、运行时和工作目录。
+ * @param args 内部辅助命令参数；空数组表示用户需要操作的管理面板。
+ * @returns 安全编码载荷后的 PowerShell 脚本；辅助程序隐藏窗口，UAC 授权仍由系统显示。
+ */
+function platformBuildElevationScript(paths: AppPaths, args: string[]): string {
+  return platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, ...args]), root: paths.root }) + `
+try {
+  $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -WindowStyle ${args.length === 0 ? "Normal" : "Hidden"} -PassThru -Wait
+  exit $child.ExitCode
+} catch {
+  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
+  throw
+}`;
+}
+
 export async function runElevated(paths: AppPaths, args: string[]): Promise<void> {
   platformAssertStandaloneEntry(paths);
   let result: PlatformCommandResult;
   if (isAdministrator()) {
     result = await platformCommand(paths.runtime, [paths.entry, ...args], { cwd: paths.root, inherit: true });
   } else if (process.platform === "win32") {
-    const script = platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, ...args]), root: paths.root }) + `
-try {
-  $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -PassThru -Wait
-  exit $child.ExitCode
-} catch {
-  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
-  throw
-}`;
+    const script = platformBuildElevationScript(paths, args);
     result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { cwd: paths.root });
   } else if (process.platform === "linux") {
     result = await platformCommand("sudo", ["--", paths.runtime, paths.entry, ...args], { cwd: paths.root, inherit: true });
@@ -678,11 +701,12 @@ export async function stopManaged(paths: AppPaths): Promise<void> {
 
 export async function restartManaged(paths: AppPaths): Promise<void> { await stopManaged(paths); await startManaged(paths); }
 
-/** Pure builders and validation helpers for tests; tests never register tasks/services or elevate. */
+/** 测试用纯构建器和校验辅助；真实计划任务验收仅在显式启用的 Windows 集成测试中执行。 */
 export const platformInternals = {
   quoteWindowsArg: platformQuoteWindowsArg, windowsArguments: platformWindowsArguments,
-  encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload,
+  encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload, powerShellProgram: platformPowerShellProgram,
   taskSpec: platformTaskSpec, buildTaskScript: platformBuildTaskScript, assessTask: platformAssessTask,
+  buildElevationScript: platformBuildElevationScript,
   systemdUnit: platformSystemdUnit, quoteSystemd: platformQuoteSystemd,
   systemdWorkingDirectory: platformSystemdWorkingDirectory,
   copyRegularTree: platformCopyRegularTree, linuxProtected: platformLinuxProtected,

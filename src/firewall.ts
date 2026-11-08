@@ -459,7 +459,8 @@ try {
 }
 `;
 
-const FIREWALL_WINDOWS_LOADER = String.raw`$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$e=[Console]::In.ReadToEnd()|ConvertFrom-Json;$p=$e.payload;& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($e.script))))`;
+// 隔离 PowerShell 7 遗留模块路径，避免 Windows PowerShell 5.1 自动加载不兼容模块。
+const FIREWALL_WINDOWS_LOADER = String.raw`$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$e=[Console]::In.ReadToEnd()|ConvertFrom-Json;$p=$e.payload;& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($e.script))))`;
 
 function firewallWindowsCommand(paths: AppPaths, plan: FirewallPlan, operation: "inspect" | "apply") {
   const programs: string[] = [], warnings: string[] = [];

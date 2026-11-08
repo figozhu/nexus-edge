@@ -2,9 +2,10 @@ import * as networkFs from "node:fs";
 import * as networkPath from "node:path";
 import * as networkCrypto from "node:crypto";
 import * as networkNet from "node:net";
+import * as networkDns from "node:dns/promises";
 import * as networkZlib from "node:zlib";
 import * as networkSqlite from "bun:sqlite";
-import { assertSupportedPlatform, atomicWrite, ensureDataDir, runCommand, validateConfig, validateNode, validateWarpProfile, nodeEngine, normalizeConnectAddress, collectConfigSecrets, redact } from "./core";
+import { assertSupportedPlatform, atomicWrite, ensureDataDir, runCommand, validateConfig, validateNode, validateWarpProfile, nodeEngine, normalizeConnectAddress, collectConfigSecrets, redact, isCoreIpv6Enabled } from "./core";
 import type { AppConfig, AppPaths, WarpProfile, NodeConfig } from "./core";
 
 export interface NetworkAsset {
@@ -728,14 +729,14 @@ function networkNodeTag(node: NodeConfig): string { return `node:${node.id}`; }
 function networkPemLines(value: string): string[] { return value.trim().split(/\r?\n/); }
 function networkHostPort(host: string, port: number): string { return `${networkNet.isIP(host) === 6 ? `[${host}]` : host}:${port}`; }
 
-function networkSingTls(node: NodeConfig): Record<string, unknown> | undefined {
+function networkSingTls(node: NodeConfig, ipv6 = false): Record<string, unknown> | undefined {
   if (node.tls.mode === "none") return undefined;
   const tls: Record<string, unknown> = { enabled: true };
   if (node.tls.serverName) tls.server_name = node.tls.serverName;
   if (node.tls.alpn.length) tls.alpn = node.tls.alpn;
   if (node.tls.mode === "reality") {
     const r = node.tls.reality;
-    tls.reality = { enabled: true, handshake: { server: r.handshakeServer, server_port: r.handshakePort }, private_key: r.privateKey, short_id: [r.shortId] };
+    tls.reality = { enabled: true, handshake: { server: r.handshakeServer, server_port: r.handshakePort, ...(!ipv6 ? { domain_resolver: { server: "dns-local", strategy: "ipv4_only" } } : {}) }, private_key: r.privateKey, short_id: [r.shortId] };
   } else {
     tls.certificate = networkPemLines(node.tls.certificatePem);
     tls.key = networkPemLines(node.tls.keyPem);
@@ -749,7 +750,7 @@ function networkSingTransport(node: NodeConfig): Record<string, unknown> | undef
   return undefined;
 }
 
-function networkSingInbound(node: NodeConfig): Record<string, unknown> {
+function networkSingInbound(node: NodeConfig, ipv6 = false): Record<string, unknown> {
   const inbound: Record<string, unknown> = { type: node.protocol, tag: networkNodeTag(node), listen: node.listen, listen_port: node.port };
   switch (node.protocol) {
     case "vmess": inbound.users = [{ uuid: node.uuid, alterId: 0 }]; break;
@@ -773,23 +774,45 @@ function networkSingInbound(node: NodeConfig): Record<string, unknown> {
       break;
     default: throw new Error(`sing-box 不负责 ${node.protocol} 节点。`);
   }
-  const tls = networkSingTls(node);
+  const tls = networkSingTls(node, ipv6);
   const transport = networkSingTransport(node);
   if (tls) inbound.tls = tls;
   if (transport) inbound.transport = transport;
   return inbound;
 }
 
+/**
+ * 检查绕过普通出站路由的 REALITY / WARP 对端；参数为规范化配置和当前核心节点。
+ * IPv4 模式遇到显式 IPv6 对端或无 IPv4 的 WARP 配置时抛出可操作错误，不篡改保存的凭据。
+ */
+function networkCheckIpv4Endpoints(config: AppConfig, nodes: NodeConfig[]): void {
+  if (isCoreIpv6Enabled(config)) return;
+  for (const node of nodes) {
+    if (node.tls.mode === "reality" && networkNet.isIP(node.tls.reality.handshakeServer) === 6) {
+      throw new Error(`节点“${node.name}”的 REALITY 目标为 IPv6；请在“核心出站 IPv6”中开启，或改用 IPv4 / 域名目标。`);
+    }
+  }
+  if (nodes.some(node => node.egress === "warp")) {
+    if (networkNet.isIP(config.warp!.endpointHost) === 6) throw new Error("WARP 对端为 IPv6；请开启核心出站 IPv6，或导入具有 IPv4 / 域名对端的配置。");
+    if (!config.warp!.addresses.some(address => networkNet.isIP(address.split("/")[0]!) === 4)) throw new Error("WARP 配置缺少 IPv4 地址；请开启核心出站 IPv6，或导入包含 IPv4 的配置。");
+  }
+}
+
+/** 将完整配置生成 sing-box 服务端配置；默认仅解析 IPv4，并拒绝显式 IPv6 出站目标。 */
 export function buildSingBoxConfig(config: AppConfig): object | null {
   const c = validateConfig(config);
   const nodes = c.nodes.filter(node => node.enabled && nodeEngine(node) === "singBox");
   if (!nodes.length) return null;
+  networkCheckIpv4Endpoints(c, nodes);
+  const ipv6 = isCoreIpv6Enabled(c);
+  const resolver = ipv6 ? "dns-local" : { server: "dns-local", strategy: "ipv4_only" };
+  const rules: Record<string, unknown>[] = ipv6 ? [] : [{ ip_version: 6, action: "reject" }];
   const warpTags = nodes.filter(node => node.egress === "warp").map(networkNodeTag);
   const generated: Record<string, unknown> = {
     log: { level: "warn", timestamp: true },
     dns: { servers: [{ type: "local", tag: "dns-local" }], final: "dns-local" },
-    inbounds: nodes.map(networkSingInbound), outbounds: [{ type: "direct", tag: "direct" }],
-    route: { final: "direct", default_domain_resolver: "dns-local" },
+    inbounds: nodes.map(node => networkSingInbound(node, ipv6)), outbounds: [{ type: "direct", tag: "direct" }],
+    route: { final: "direct", default_domain_resolver: resolver, rules },
   };
   if (warpTags.length) {
     const w = c.warp!;
@@ -799,12 +822,13 @@ export function buildSingBoxConfig(config: AppConfig): object | null {
     ], final: "dns-local" };
     generated.endpoints = [{
       type: "wireguard", tag: "warp-out", system: false, mtu: 1280,
-      address: w.addresses, private_key: w.privateKey, domain_resolver: "dns-local",
+      address: ipv6 ? w.addresses : w.addresses.filter(address => networkNet.isIP(address.split("/")[0]!) === 4), private_key: w.privateKey, domain_resolver: resolver,
       peers: [{ address: w.endpointHost, port: w.endpointPort, public_key: w.peerPublicKey,
-        allowed_ips: ["0.0.0.0/0", "::/0"], persistent_keepalive_interval: 25, reserved: w.reserved }],
+        allowed_ips: ipv6 ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"], persistent_keepalive_interval: 25, reserved: w.reserved }],
     }];
-    generated.route = { final: "direct", default_domain_resolver: "dns-local", rules: [
-      { inbound: warpTags, action: "resolve", server: "dns-warp" },
+    generated.route = { final: "direct", default_domain_resolver: resolver, rules: [
+      ...rules,
+      { inbound: warpTags, action: "resolve", server: "dns-warp", ...(!ipv6 ? { strategy: "ipv4_only" } : {}) },
       { inbound: warpTags, action: "route", outbound: "warp-out" },
     ] };
   }
@@ -828,32 +852,89 @@ function networkXrayInbound(node: NodeConfig): Record<string, unknown> {
     settings: { clients: [{ id: node.uuid, ...(node.flow ? { flow: node.flow } : {}) }], decryption: node.vlessDecryption }, streamSettings: stream };
 }
 
+/** 将完整配置生成 Xray 服务端配置；IPv4 强制解析与显式 IPv6 阻断同时生效，开启后恢复双栈。 */
 export function buildXrayConfig(config: AppConfig): object | null {
   const c = validateConfig(config);
   const nodes = c.nodes.filter(node => node.enabled && nodeEngine(node) === "xray");
   if (!nodes.length) return null;
+  networkCheckIpv4Endpoints(c, nodes);
+  const ipv6 = isCoreIpv6Enabled(c);
+  const rules: Record<string, unknown>[] = ipv6 ? [] : [{ type: "field", ip: ["::/0"], outboundTag: "block-ipv6" }];
   const warpTags = nodes.filter(node => node.egress === "warp").map(networkNodeTag);
-  const outbounds: Record<string, unknown>[] = [{ tag: "direct", protocol: "freedom", settings: { domainStrategy: "AsIs" } }];
+  const outbounds: Record<string, unknown>[] = [{ tag: "direct", protocol: "freedom", settings: { domainStrategy: ipv6 ? "AsIs" : "ForceIPv4" } }];
   const generated: Record<string, unknown> = { log: { loglevel: "warning" }, inbounds: nodes.map(networkXrayInbound), outbounds };
+  if (!ipv6) {
+    generated.dns = { queryStrategy: "UseIPv4", servers: ["localhost"] };
+    generated.routing = { domainStrategy: "AsIs", rules };
+  }
   if (warpTags.length) {
     const w = c.warp!;
     outbounds.push({ tag: "warp-out", protocol: "wireguard", settings: {
-      secretKey: w.privateKey, address: w.addresses, mtu: 1280, noKernelTun: true, reserved: w.reserved, domainStrategy: "ForceIP",
-      peers: [{ publicKey: w.peerPublicKey, endpoint: networkHostPort(w.endpointHost, w.endpointPort), allowedIPs: ["0.0.0.0/0", "::/0"], keepAlive: 25 }],
+      secretKey: w.privateKey, address: ipv6 ? w.addresses : w.addresses.filter(address => networkNet.isIP(address.split("/")[0]!) === 4), mtu: 1280, noKernelTun: true, reserved: w.reserved, domainStrategy: ipv6 ? "ForceIP" : "ForceIPv4",
+      peers: [{ publicKey: w.peerPublicKey, endpoint: networkHostPort(w.endpointHost, w.endpointPort), allowedIPs: ipv6 ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"], keepAlive: 25 }],
     } });
     // The native WireGuard outbound resolves targets through the built-in DNS.
     // Resolve ONLY the peer hostname using system DNS, avoiding a recursive
     // attempt to establish WARP by sending its own bootstrap lookup over WARP.
-    generated.dns = { tag: "warp-dns", queryStrategy: "UseIP", disableFallbackIfMatch: true, servers: [
+    generated.dns = { tag: "warp-dns", queryStrategy: ipv6 ? "UseIP" : "UseIPv4", disableFallbackIfMatch: true, servers: [
       ...(!networkNet.isIP(w.endpointHost) ? [{ address: "localhost", domains: [`full:${w.endpointHost}`], skipFallback: true }] : []),
       { address: "1.1.1.1", port: 53 },
     ] };
     generated.routing = { domainStrategy: "AsIs", rules: [
+      ...rules,
       { type: "field", inboundTag: ["warp-dns"], outboundTag: "warp-out" },
       { type: "field", inboundTag: warpTags, outboundTag: "warp-out" },
     ] };
   }
+  if (!ipv6) outbounds.push({ tag: "block-ipv6", protocol: "blackhole", settings: {} });
   return generated;
+}
+
+/** 系统 IPv4 解析器的可注入边界；hostname 为规范化域名，family 始终为 4。 */
+export type NetworkIpv4Lookup = (hostname: string, options: { family: 4 }) => Promise<{ address: string; family: number }>;
+
+/** REALITY 运行配置的解析选项；timeoutMs 限定一次构建的总解析时间，默认五秒。 */
+export interface RuntimeXrayDnsOptions { lookup?: NetworkIpv4Lookup; timeoutMs?: number }
+
+/**
+ * 构建实际运行的 Xray 配置，config 为完整应用配置，options 可注入测试解析器及超时。
+ * Xray REALITY 使用原生拨号器，入站 sockopt 不约束握手目标的地址族；IPv4 模式因此
+ * 先解析所有启用的 REALITY 域名，并仅在生成的运行副本内替换目标，保留保存配置与 SNI。
+ * 同一域名只查询一次，IPv6 开启、停用节点、其他核心及 IP 字面量不查询；失败不写文件。
+ * 返回纯生成器等价配置或无 Xray 节点时的 null；解析失败、超时、非 IPv4 结果均抛出。
+ */
+export async function buildRuntimeXrayConfig(config: AppConfig, options: RuntimeXrayDnsOptions = {}): Promise<object | null> {
+  const c = validateConfig(config);
+  const generated = buildXrayConfig(c);
+  if (!generated || isCoreIpv6Enabled(c)) return generated;
+  const hosts = [...new Set(c.nodes.filter(node => node.enabled && nodeEngine(node) === "xray" && node.tls.mode === "reality" && !networkNet.isIP(node.tls.reality.handshakeServer)).map(node => node.tls.reality.handshakeServer))];
+  if (!hosts.length) return generated;
+  const timeoutMs = options.timeoutMs ?? 5000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("REALITY IPv4 解析超时必须是正数。");
+  const lookup = options.lookup ?? ((hostname, lookupOptions) => networkDns.lookup(hostname, lookupOptions));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let entries: [string, string][];
+  try {
+    entries = await Promise.race([
+      Promise.all(hosts.map(async (hostname): Promise<[string, string]> => {
+        try {
+          const answer = await lookup(hostname, { family: 4 });
+          if (answer.family !== 4 || networkNet.isIP(answer.address) !== 4) throw new Error("解析器未返回 IPv4 地址");
+          return [hostname, answer.address];
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`REALITY 目标 ${hostname} 无法解析为 IPv4：${detail}。请检查 DNS / A 记录，或在“核心出站 IPv6”中开启双栈。`);
+        }
+      })),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`REALITY 目标 IPv4 解析超时（${timeoutMs}ms）；请检查 DNS / A 记录后重试。`)), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+  const resolved = new Map(entries);
+  const nodes = c.nodes.map(node => {
+    const address = node.enabled && nodeEngine(node) === "xray" && node.tls.mode === "reality" ? resolved.get(node.tls.reality.handshakeServer) : undefined;
+    return address ? { ...node, tls: { ...node.tls, reality: { ...node.tls.reality, handshakeServer: address } } } : node;
+  });
+  return buildXrayConfig({ ...c, nodes });
 }
 
 function networkSafeNodeId(nodeId: string): string {
@@ -863,14 +944,15 @@ function networkSafeNodeId(nodeId: string): string {
 export function cloudflaredTokenPath(paths: AppPaths, nodeId: string): string { return networkPath.join(paths.data, `cloudflared-${networkSafeNodeId(nodeId)}.token`); }
 export function cloudflaredConfigPath(paths: AppPaths, nodeId: string): string { return networkPath.join(paths.data, `cloudflared-${networkSafeNodeId(nodeId)}.yaml`); }
 
-export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsPort: number): string[] {
+/** 生成隧道参数；ipv6 为应用开关，缺省强制 IPv4 边缘连接，已有本地 origin 保持不变。 */
+export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsPort: number, ipv6 = false): string[] {
   const n = validateNode(node);
   if (n.tunnel.mode === "none") throw new Error("此节点没有启用隧道。");
   if (!Number.isInteger(metricsPort) || metricsPort < 1024 || metricsPort > 65535) throw new Error("cloudflared 指标端口无效。");
   const args = [
     "tunnel", "--config", cloudflaredConfigPath(paths, n.id), "--no-autoupdate",
     // Quick tunnels otherwise override the unset default to QUIC, disabling fallback.
-    "--protocol", n.tunnel.protocol, "--edge-ip-version", "auto",
+    "--protocol", n.tunnel.protocol, "--edge-ip-version", ipv6 ? "auto" : "4",
     "--metrics", `127.0.0.1:${metricsPort}`, "--loglevel", "info", "--output", "json",
   ];
   const origin = n.listen === "0.0.0.0" ? "127.0.0.1" : n.listen === "::" ? "::1" : n.listen;
@@ -880,13 +962,15 @@ export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsP
 }
 
 /** Check all selected cores before publishing any generated runtime configuration. */
-export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void } = {}): Promise<Binaries> {
+export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions } = {}): Promise<Binaries> {
   const c = validateConfig(config);
   if (!c.nodes.some(node => node.enabled)) throw new Error("没有启用的节点；请先创建或启用至少一个节点。");
+  // 所有配置与 REALITY 地址先准备成功，再安装核心或写入候选文件；DNS 失败不改变原运行文件。
+  const singConfig = buildSingBoxConfig(c), xrayConfig = await buildRuntimeXrayConfig(c, options.realityDns);
   const binaries = await ensureBinaries(paths, c, options.report, options.releases);
   const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string }[] = [];
   for (const [tool, path, generated] of [
-    ["singBox", paths.singConfig, buildSingBoxConfig(c)], ["xray", paths.xrayConfig, buildXrayConfig(c)],
+    ["singBox", paths.singConfig, singConfig], ["xray", paths.xrayConfig, xrayConfig],
   ] as const) if (generated) jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, text: JSON.stringify(generated, null, 2) + "\n" });
   try {
     for (const job of jobs) atomicWrite(job.candidate, job.text);

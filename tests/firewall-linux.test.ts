@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe as bunDescribe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +6,10 @@ import * as crypto from "node:crypto";
 import * as sqlite from "bun:sqlite";
 import { applyLinuxFirewall, inspectLinuxFirewall, transferLinuxUfwOwnership, linuxFirewallInternals as linux, type LinuxFirewallContext } from "../src/firewall-linux.ts";
 import type { FirewallRule, FirewallPlan, FirewallOptions, FirewallCommandRunner, FirewallCommandResult } from "../src/firewall.ts";
+
+// 这些测试除模拟防火墙命令外，还真实验证 POSIX 权限、O_NOFOLLOW、目录 fsync 与锁文件。
+// Windows 的 chmod/目录权限语义不同，须在 Linux CI 运行，不能为适配测试削弱生产保护。
+const describe = bunDescribe.skipIf(process.platform !== "linux");
 
 const temporaryDirectories: string[] = [];
 function context(): LinuxFirewallContext {

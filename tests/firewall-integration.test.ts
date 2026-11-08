@@ -56,8 +56,9 @@ describe("firewall configuration compatibility", () => {
     const legacyRuntime = { ...oldWithNode, nodes: oldWithNode.nodes.map(({ address, publicPort, ...node }) => node) };
     const originalHash = createHash("sha256").update(JSON.stringify(legacyRuntime)).digest("hex");
     const changed = { ...oldWithNode, firewall: { mode: "manual" as const, linuxBackend: "firewalld" as const, firewalldZone: "public" } };
-    expect(runtimeConfigFingerprint(oldWithNode)).toBe(originalHash);
-    expect(runtimeConfigFingerprint(changed)).toBe(originalHash);
+    // 2.3.1 的默认 IPv4 策略必须使旧双栈 worker 待重启；防火墙偏好本身仍不影响核心指纹。
+    expect(runtimeConfigFingerprint(oldWithNode)).not.toBe(originalHash);
+    expect(runtimeConfigFingerprint(changed)).toBe(runtimeConfigFingerprint(oldWithNode));
     expect(configFingerprint(changed)).not.toBe(configFingerprint(oldWithNode));
     expect(validateConfig(changed).firewall).toEqual(changed.firewall);
   });

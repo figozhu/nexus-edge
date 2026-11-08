@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 2.3.0 — automatic firewall ports, stable cores, multi-protocol nodes and optional tunnels.
+ * NexusEdge 2.3.1 — IPv4-first cores, IPv6 controls and reliable Windows startup.
  * Run: bun nexus-edge.ts
  * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.
  * Generated from the typed source modules using scripts/build.ts.
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.0";
+export const APP_VERSION = "2.3.1";
 
 export interface WarpProfile {
   privateKey: string;
@@ -84,6 +84,8 @@ export interface FirewallSettings {
 
 export interface AppConfig {
   schema: 2;
+  /** 核心出站是否允许 IPv6；旧配置未设置时按 false 处理，不改变已有入站监听。 */
+  coreIpv6?: boolean;
   nodes: NodeConfig[];
   warp?: WarpProfile;
   webhook: { kind: "none" | "generic" | "feishu" | "wecom" | "dingtalk" | "bark"; url: string };
@@ -192,7 +194,8 @@ export function ensureDataDir(paths: AppPaths): void {
     if (coreFs.existsSync(markerPath)) {
       const marker = JSON.parse(coreFs.readFileSync(markerPath, "utf8")) as { app?: string; schema?: number; entry?: string; runtime?: string };
       if (marker.app === "NexusEdge" && marker.schema === 1 && typeof marker.entry === "string" && corePath.resolve(marker.entry).toLowerCase() === paths.entry.toLowerCase()) {
-        const script = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)";
+        // 只允许 Windows PowerShell 自带模块，避免继承 PowerShell 7 的模块目录。
+        const script = "$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules'); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)";
         const query = coreCp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true, timeout: 20000 });
         const programData = query.stdout?.trim().replace(/^\uFEFF/, "");
         if (query.status === 0 && programData && corePath.win32.resolve(paths.root).toLowerCase() === corePath.win32.join(programData, "NexusEdge").toLowerCase()) {
@@ -532,6 +535,13 @@ export function getFirewallSettings(config: AppConfig): FirewallSettings {
   return config.firewall === undefined ? { mode: "auto", linuxBackend: "auto", firewalldZone: "" } : validateFirewallSettings(config.firewall);
 }
 
+/**
+ * 读取核心出站 IPv6 开关。
+ * @param config 应用配置；缺省字段兼容旧版配置，默认禁用。
+ * @returns 仅显式 true 时允许核心使用 IPv6 出站。
+ */
+export function isCoreIpv6Enabled(config: AppConfig): boolean { return config.coreIpv6 === true; }
+
 function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
   if (a.port !== b.port || !nodeListenNetworks(a).some(network => nodeListenNetworks(b).includes(network))) return false;
   if (a.listen === b.listen || a.listen === "::" || b.listen === "::") return true;
@@ -541,6 +551,7 @@ function coreListenersOverlap(a: NodeConfig, b: NodeConfig): boolean {
 
 export function validateConfig(value: unknown, options: { allowExpiredCertificate?: boolean } = {}): AppConfig {
   const v = coreObject(value, "配置");
+  if (v.coreIpv6 !== undefined && typeof v.coreIpv6 !== "boolean") throw new Error("核心 IPv6 开关必须为 true 或 false。");
   if (v.schema !== 2) throw new Error("不支持此配置版本；请通过 readConfig 升级旧配置，并保留原文件。");
   if (!Array.isArray(v.nodes) || v.nodes.length > 32) throw new Error("nodes 必须是最多 32 个节点的数组。");
   const nodes = v.nodes.map(node => validateNode(node, options));
@@ -552,7 +563,7 @@ export function validateConfig(value: unknown, options: { allowExpiredCertificat
   }
   const warp = v.warp === undefined ? undefined : validateWarpProfile(v.warp);
   if (!warp && nodes.some(node => node.enabled && node.egress === "warp")) throw new Error("已启用的节点选择了 WARP 出站，但尚未配置有效的 WARP 凭据。");
-  return { schema: 2, nodes, ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
+  return { schema: 2, nodes, ...(v.coreIpv6 === undefined ? {} : { coreIpv6: v.coreIpv6 }), ...(warp ? { warp } : {}), webhook: coreValidateWebhook(v.webhook), ...(v.firewall === undefined ? {} : { firewall: validateFirewallSettings(v.firewall) }) };
 }
 
 /** Convert only the released v1 shape; never reinterpret damaged legacy data. */
@@ -649,9 +660,11 @@ export function configFingerprint(config: AppConfig): string {
  * Keep every other field, including node names and shared settings, conservative. */
 export function runtimeConfigFingerprint(config: AppConfig): string {
   const normalized = validateConfig(config, { allowExpiredCertificate: true });
-  const { firewall: _firewall, ...coreSettings } = normalized;
+  const { firewall: _firewall, coreIpv6: _coreIpv6, ...coreSettings } = normalized;
   const runtimeConfig = {
     ...coreSettings,
+    // 有效默认值必须进入指纹：升级前的双栈 worker 不能被误认为已应用新的 IPv4 默认策略。
+    coreIpv6: isCoreIpv6Enabled(normalized),
     nodes: normalized.nodes.map(({ address: _address, publicPort: _publicPort, ...node }) => node),
   };
   return coreCrypto.createHash("sha256").update(JSON.stringify(runtimeConfig)).digest("hex");
@@ -1292,6 +1305,7 @@ import * as networkFs from "node:fs";
 import * as networkPath from "node:path";
 import * as networkCrypto from "node:crypto";
 import * as networkNet from "node:net";
+import * as networkDns from "node:dns/promises";
 import * as networkZlib from "node:zlib";
 import * as networkSqlite from "bun:sqlite";
 
@@ -2016,14 +2030,14 @@ function networkNodeTag(node: NodeConfig): string { return `node:${node.id}`; }
 function networkPemLines(value: string): string[] { return value.trim().split(/\r?\n/); }
 function networkHostPort(host: string, port: number): string { return `${networkNet.isIP(host) === 6 ? `[${host}]` : host}:${port}`; }
 
-function networkSingTls(node: NodeConfig): Record<string, unknown> | undefined {
+function networkSingTls(node: NodeConfig, ipv6 = false): Record<string, unknown> | undefined {
   if (node.tls.mode === "none") return undefined;
   const tls: Record<string, unknown> = { enabled: true };
   if (node.tls.serverName) tls.server_name = node.tls.serverName;
   if (node.tls.alpn.length) tls.alpn = node.tls.alpn;
   if (node.tls.mode === "reality") {
     const r = node.tls.reality;
-    tls.reality = { enabled: true, handshake: { server: r.handshakeServer, server_port: r.handshakePort }, private_key: r.privateKey, short_id: [r.shortId] };
+    tls.reality = { enabled: true, handshake: { server: r.handshakeServer, server_port: r.handshakePort, ...(!ipv6 ? { domain_resolver: { server: "dns-local", strategy: "ipv4_only" } } : {}) }, private_key: r.privateKey, short_id: [r.shortId] };
   } else {
     tls.certificate = networkPemLines(node.tls.certificatePem);
     tls.key = networkPemLines(node.tls.keyPem);
@@ -2037,7 +2051,7 @@ function networkSingTransport(node: NodeConfig): Record<string, unknown> | undef
   return undefined;
 }
 
-function networkSingInbound(node: NodeConfig): Record<string, unknown> {
+function networkSingInbound(node: NodeConfig, ipv6 = false): Record<string, unknown> {
   const inbound: Record<string, unknown> = { type: node.protocol, tag: networkNodeTag(node), listen: node.listen, listen_port: node.port };
   switch (node.protocol) {
     case "vmess": inbound.users = [{ uuid: node.uuid, alterId: 0 }]; break;
@@ -2061,23 +2075,45 @@ function networkSingInbound(node: NodeConfig): Record<string, unknown> {
       break;
     default: throw new Error(`sing-box 不负责 ${node.protocol} 节点。`);
   }
-  const tls = networkSingTls(node);
+  const tls = networkSingTls(node, ipv6);
   const transport = networkSingTransport(node);
   if (tls) inbound.tls = tls;
   if (transport) inbound.transport = transport;
   return inbound;
 }
 
+/**
+ * 检查绕过普通出站路由的 REALITY / WARP 对端；参数为规范化配置和当前核心节点。
+ * IPv4 模式遇到显式 IPv6 对端或无 IPv4 的 WARP 配置时抛出可操作错误，不篡改保存的凭据。
+ */
+function networkCheckIpv4Endpoints(config: AppConfig, nodes: NodeConfig[]): void {
+  if (isCoreIpv6Enabled(config)) return;
+  for (const node of nodes) {
+    if (node.tls.mode === "reality" && networkNet.isIP(node.tls.reality.handshakeServer) === 6) {
+      throw new Error(`节点“${node.name}”的 REALITY 目标为 IPv6；请在“核心出站 IPv6”中开启，或改用 IPv4 / 域名目标。`);
+    }
+  }
+  if (nodes.some(node => node.egress === "warp")) {
+    if (networkNet.isIP(config.warp!.endpointHost) === 6) throw new Error("WARP 对端为 IPv6；请开启核心出站 IPv6，或导入具有 IPv4 / 域名对端的配置。");
+    if (!config.warp!.addresses.some(address => networkNet.isIP(address.split("/")[0]!) === 4)) throw new Error("WARP 配置缺少 IPv4 地址；请开启核心出站 IPv6，或导入包含 IPv4 的配置。");
+  }
+}
+
+/** 将完整配置生成 sing-box 服务端配置；默认仅解析 IPv4，并拒绝显式 IPv6 出站目标。 */
 export function buildSingBoxConfig(config: AppConfig): object | null {
   const c = validateConfig(config);
   const nodes = c.nodes.filter(node => node.enabled && nodeEngine(node) === "singBox");
   if (!nodes.length) return null;
+  networkCheckIpv4Endpoints(c, nodes);
+  const ipv6 = isCoreIpv6Enabled(c);
+  const resolver = ipv6 ? "dns-local" : { server: "dns-local", strategy: "ipv4_only" };
+  const rules: Record<string, unknown>[] = ipv6 ? [] : [{ ip_version: 6, action: "reject" }];
   const warpTags = nodes.filter(node => node.egress === "warp").map(networkNodeTag);
   const generated: Record<string, unknown> = {
     log: { level: "warn", timestamp: true },
     dns: { servers: [{ type: "local", tag: "dns-local" }], final: "dns-local" },
-    inbounds: nodes.map(networkSingInbound), outbounds: [{ type: "direct", tag: "direct" }],
-    route: { final: "direct", default_domain_resolver: "dns-local" },
+    inbounds: nodes.map(node => networkSingInbound(node, ipv6)), outbounds: [{ type: "direct", tag: "direct" }],
+    route: { final: "direct", default_domain_resolver: resolver, rules },
   };
   if (warpTags.length) {
     const w = c.warp!;
@@ -2087,12 +2123,13 @@ export function buildSingBoxConfig(config: AppConfig): object | null {
     ], final: "dns-local" };
     generated.endpoints = [{
       type: "wireguard", tag: "warp-out", system: false, mtu: 1280,
-      address: w.addresses, private_key: w.privateKey, domain_resolver: "dns-local",
+      address: ipv6 ? w.addresses : w.addresses.filter(address => networkNet.isIP(address.split("/")[0]!) === 4), private_key: w.privateKey, domain_resolver: resolver,
       peers: [{ address: w.endpointHost, port: w.endpointPort, public_key: w.peerPublicKey,
-        allowed_ips: ["0.0.0.0/0", "::/0"], persistent_keepalive_interval: 25, reserved: w.reserved }],
+        allowed_ips: ipv6 ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"], persistent_keepalive_interval: 25, reserved: w.reserved }],
     }];
-    generated.route = { final: "direct", default_domain_resolver: "dns-local", rules: [
-      { inbound: warpTags, action: "resolve", server: "dns-warp" },
+    generated.route = { final: "direct", default_domain_resolver: resolver, rules: [
+      ...rules,
+      { inbound: warpTags, action: "resolve", server: "dns-warp", ...(!ipv6 ? { strategy: "ipv4_only" } : {}) },
       { inbound: warpTags, action: "route", outbound: "warp-out" },
     ] };
   }
@@ -2116,32 +2153,89 @@ function networkXrayInbound(node: NodeConfig): Record<string, unknown> {
     settings: { clients: [{ id: node.uuid, ...(node.flow ? { flow: node.flow } : {}) }], decryption: node.vlessDecryption }, streamSettings: stream };
 }
 
+/** 将完整配置生成 Xray 服务端配置；IPv4 强制解析与显式 IPv6 阻断同时生效，开启后恢复双栈。 */
 export function buildXrayConfig(config: AppConfig): object | null {
   const c = validateConfig(config);
   const nodes = c.nodes.filter(node => node.enabled && nodeEngine(node) === "xray");
   if (!nodes.length) return null;
+  networkCheckIpv4Endpoints(c, nodes);
+  const ipv6 = isCoreIpv6Enabled(c);
+  const rules: Record<string, unknown>[] = ipv6 ? [] : [{ type: "field", ip: ["::/0"], outboundTag: "block-ipv6" }];
   const warpTags = nodes.filter(node => node.egress === "warp").map(networkNodeTag);
-  const outbounds: Record<string, unknown>[] = [{ tag: "direct", protocol: "freedom", settings: { domainStrategy: "AsIs" } }];
+  const outbounds: Record<string, unknown>[] = [{ tag: "direct", protocol: "freedom", settings: { domainStrategy: ipv6 ? "AsIs" : "ForceIPv4" } }];
   const generated: Record<string, unknown> = { log: { loglevel: "warning" }, inbounds: nodes.map(networkXrayInbound), outbounds };
+  if (!ipv6) {
+    generated.dns = { queryStrategy: "UseIPv4", servers: ["localhost"] };
+    generated.routing = { domainStrategy: "AsIs", rules };
+  }
   if (warpTags.length) {
     const w = c.warp!;
     outbounds.push({ tag: "warp-out", protocol: "wireguard", settings: {
-      secretKey: w.privateKey, address: w.addresses, mtu: 1280, noKernelTun: true, reserved: w.reserved, domainStrategy: "ForceIP",
-      peers: [{ publicKey: w.peerPublicKey, endpoint: networkHostPort(w.endpointHost, w.endpointPort), allowedIPs: ["0.0.0.0/0", "::/0"], keepAlive: 25 }],
+      secretKey: w.privateKey, address: ipv6 ? w.addresses : w.addresses.filter(address => networkNet.isIP(address.split("/")[0]!) === 4), mtu: 1280, noKernelTun: true, reserved: w.reserved, domainStrategy: ipv6 ? "ForceIP" : "ForceIPv4",
+      peers: [{ publicKey: w.peerPublicKey, endpoint: networkHostPort(w.endpointHost, w.endpointPort), allowedIPs: ipv6 ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"], keepAlive: 25 }],
     } });
     // The native WireGuard outbound resolves targets through the built-in DNS.
     // Resolve ONLY the peer hostname using system DNS, avoiding a recursive
     // attempt to establish WARP by sending its own bootstrap lookup over WARP.
-    generated.dns = { tag: "warp-dns", queryStrategy: "UseIP", disableFallbackIfMatch: true, servers: [
+    generated.dns = { tag: "warp-dns", queryStrategy: ipv6 ? "UseIP" : "UseIPv4", disableFallbackIfMatch: true, servers: [
       ...(!networkNet.isIP(w.endpointHost) ? [{ address: "localhost", domains: [`full:${w.endpointHost}`], skipFallback: true }] : []),
       { address: "1.1.1.1", port: 53 },
     ] };
     generated.routing = { domainStrategy: "AsIs", rules: [
+      ...rules,
       { type: "field", inboundTag: ["warp-dns"], outboundTag: "warp-out" },
       { type: "field", inboundTag: warpTags, outboundTag: "warp-out" },
     ] };
   }
+  if (!ipv6) outbounds.push({ tag: "block-ipv6", protocol: "blackhole", settings: {} });
   return generated;
+}
+
+/** 系统 IPv4 解析器的可注入边界；hostname 为规范化域名，family 始终为 4。 */
+export type NetworkIpv4Lookup = (hostname: string, options: { family: 4 }) => Promise<{ address: string; family: number }>;
+
+/** REALITY 运行配置的解析选项；timeoutMs 限定一次构建的总解析时间，默认五秒。 */
+export interface RuntimeXrayDnsOptions { lookup?: NetworkIpv4Lookup; timeoutMs?: number }
+
+/**
+ * 构建实际运行的 Xray 配置，config 为完整应用配置，options 可注入测试解析器及超时。
+ * Xray REALITY 使用原生拨号器，入站 sockopt 不约束握手目标的地址族；IPv4 模式因此
+ * 先解析所有启用的 REALITY 域名，并仅在生成的运行副本内替换目标，保留保存配置与 SNI。
+ * 同一域名只查询一次，IPv6 开启、停用节点、其他核心及 IP 字面量不查询；失败不写文件。
+ * 返回纯生成器等价配置或无 Xray 节点时的 null；解析失败、超时、非 IPv4 结果均抛出。
+ */
+export async function buildRuntimeXrayConfig(config: AppConfig, options: RuntimeXrayDnsOptions = {}): Promise<object | null> {
+  const c = validateConfig(config);
+  const generated = buildXrayConfig(c);
+  if (!generated || isCoreIpv6Enabled(c)) return generated;
+  const hosts = [...new Set(c.nodes.filter(node => node.enabled && nodeEngine(node) === "xray" && node.tls.mode === "reality" && !networkNet.isIP(node.tls.reality.handshakeServer)).map(node => node.tls.reality.handshakeServer))];
+  if (!hosts.length) return generated;
+  const timeoutMs = options.timeoutMs ?? 5000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("REALITY IPv4 解析超时必须是正数。");
+  const lookup = options.lookup ?? ((hostname, lookupOptions) => networkDns.lookup(hostname, lookupOptions));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let entries: [string, string][];
+  try {
+    entries = await Promise.race([
+      Promise.all(hosts.map(async (hostname): Promise<[string, string]> => {
+        try {
+          const answer = await lookup(hostname, { family: 4 });
+          if (answer.family !== 4 || networkNet.isIP(answer.address) !== 4) throw new Error("解析器未返回 IPv4 地址");
+          return [hostname, answer.address];
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`REALITY 目标 ${hostname} 无法解析为 IPv4：${detail}。请检查 DNS / A 记录，或在“核心出站 IPv6”中开启双栈。`);
+        }
+      })),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`REALITY 目标 IPv4 解析超时（${timeoutMs}ms）；请检查 DNS / A 记录后重试。`)), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+  const resolved = new Map(entries);
+  const nodes = c.nodes.map(node => {
+    const address = node.enabled && nodeEngine(node) === "xray" && node.tls.mode === "reality" ? resolved.get(node.tls.reality.handshakeServer) : undefined;
+    return address ? { ...node, tls: { ...node.tls, reality: { ...node.tls.reality, handshakeServer: address } } } : node;
+  });
+  return buildXrayConfig({ ...c, nodes });
 }
 
 function networkSafeNodeId(nodeId: string): string {
@@ -2151,14 +2245,15 @@ function networkSafeNodeId(nodeId: string): string {
 export function cloudflaredTokenPath(paths: AppPaths, nodeId: string): string { return networkPath.join(paths.data, `cloudflared-${networkSafeNodeId(nodeId)}.token`); }
 export function cloudflaredConfigPath(paths: AppPaths, nodeId: string): string { return networkPath.join(paths.data, `cloudflared-${networkSafeNodeId(nodeId)}.yaml`); }
 
-export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsPort: number): string[] {
+/** 生成隧道参数；ipv6 为应用开关，缺省强制 IPv4 边缘连接，已有本地 origin 保持不变。 */
+export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsPort: number, ipv6 = false): string[] {
   const n = validateNode(node);
   if (n.tunnel.mode === "none") throw new Error("此节点没有启用隧道。");
   if (!Number.isInteger(metricsPort) || metricsPort < 1024 || metricsPort > 65535) throw new Error("cloudflared 指标端口无效。");
   const args = [
     "tunnel", "--config", cloudflaredConfigPath(paths, n.id), "--no-autoupdate",
     // Quick tunnels otherwise override the unset default to QUIC, disabling fallback.
-    "--protocol", n.tunnel.protocol, "--edge-ip-version", "auto",
+    "--protocol", n.tunnel.protocol, "--edge-ip-version", ipv6 ? "auto" : "4",
     "--metrics", `127.0.0.1:${metricsPort}`, "--loglevel", "info", "--output", "json",
   ];
   const origin = n.listen === "0.0.0.0" ? "127.0.0.1" : n.listen === "::" ? "::1" : n.listen;
@@ -2168,13 +2263,15 @@ export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsP
 }
 
 /** Check all selected cores before publishing any generated runtime configuration. */
-export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void } = {}): Promise<Binaries> {
+export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions } = {}): Promise<Binaries> {
   const c = validateConfig(config);
   if (!c.nodes.some(node => node.enabled)) throw new Error("没有启用的节点；请先创建或启用至少一个节点。");
+  // 所有配置与 REALITY 地址先准备成功，再安装核心或写入候选文件；DNS 失败不改变原运行文件。
+  const singConfig = buildSingBoxConfig(c), xrayConfig = await buildRuntimeXrayConfig(c, options.realityDns);
   const binaries = await ensureBinaries(paths, c, options.report, options.releases);
   const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string }[] = [];
   for (const [tool, path, generated] of [
-    ["singBox", paths.singConfig, buildSingBoxConfig(c)], ["xray", paths.xrayConfig, buildXrayConfig(c)],
+    ["singBox", paths.singConfig, singConfig], ["xray", paths.xrayConfig, xrayConfig],
   ] as const) if (generated) jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, text: JSON.stringify(generated, null, 2) + "\n" });
   try {
     for (const job of jobs) atomicWrite(job.candidate, job.text);
@@ -2537,11 +2634,24 @@ function platformPowerShellPayload(value: unknown): string {
   return `$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(JSON.stringify(value), "utf8").toString("base64")}')) | ConvertFrom-Json;\n`;
 }
 
+/**
+ * 包装在 Windows PowerShell 5.1 中执行的系统脚本。
+ * @param script 已由调用方构建的脚本；路径等外部输入必须通过 JSON 载荷传递。
+ * @returns 仅使用该解释器系统模块目录、统一 UTF-8 输出和异常退出码的完整脚本。
+ * Bun 从 PowerShell 7 启动时会继承其 PSModulePath，5.1 自动加载同名模块将失败。
+ * 因此必须在任何可能自动加载模块的命令之前设置子进程内的模块路径；不修改用户或系统环境。
+ */
 function platformPowerShellProgram(script: string): string {
-  return `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\ntry {\n${script}\n} catch {\n [Console]::Error.WriteLine($_.Exception.Message)\n exit 1\n}\n`;
+  return `$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\ntry {\n${script}\n} catch {\n [Console]::Error.WriteLine($_.Exception.Message)\n exit 1\n}\n`;
 }
 
-async function platformPowerShell(script: string, timeoutMs = 60000): Promise<string> {
+/**
+ * 在隐藏的 Windows PowerShell 5.1 子进程中执行受控系统操作。
+ * @param script 受控脚本字符串；勿直接拼接用户输入，应使用 JSON/Base64 载荷。
+ * @param timeoutMs 超时毫秒数，默认 60 秒；超时或非零退出码会抛出含上下文的异常。
+ * @returns 去除首尾空白及 BOM 的 UTF-8 标准输出。
+ */
+export async function platformPowerShell(script: string, timeoutMs = 60000): Promise<string> {
   const result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { timeoutMs });
   return platformRequireSuccess(result, "Windows 系统操作");
 }
@@ -2691,20 +2801,30 @@ function platformAssertStandaloneEntry(paths: AppPaths): void {
   if (/\b(?:from\s*|import\s*\(\s*|require\s*\(\s*)["']\.{1,2}\//.test(source) || /\bimport\s*["']\.{1,2}\//.test(source)) throw new Error("入口仍包含相对模块依赖，请使用构建后的完整单文件 nexus-edge.ts。");
 }
 
+/**
+ * 为 Windows UAC 构建提权脚本，并按是否打开交互面板选择窗口可见性。
+ * @param paths 已校验的单文件入口、运行时和工作目录。
+ * @param args 内部辅助命令参数；空数组表示用户需要操作的管理面板。
+ * @returns 安全编码载荷后的 PowerShell 脚本；辅助程序隐藏窗口，UAC 授权仍由系统显示。
+ */
+function platformBuildElevationScript(paths: AppPaths, args: string[]): string {
+  return platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, ...args]), root: paths.root }) + `
+try {
+  $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -WindowStyle ${args.length === 0 ? "Normal" : "Hidden"} -PassThru -Wait
+  exit $child.ExitCode
+} catch {
+  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
+  throw
+}`;
+}
+
 export async function runElevated(paths: AppPaths, args: string[]): Promise<void> {
   platformAssertStandaloneEntry(paths);
   let result: PlatformCommandResult;
   if (isAdministrator()) {
     result = await platformCommand(paths.runtime, [paths.entry, ...args], { cwd: paths.root, inherit: true });
   } else if (process.platform === "win32") {
-    const script = platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, ...args]), root: paths.root }) + `
-try {
-  $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -PassThru -Wait
-  exit $child.ExitCode
-} catch {
-  if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
-  throw
-}`;
+    const script = platformBuildElevationScript(paths, args);
     result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { cwd: paths.root });
   } else if (process.platform === "linux") {
     result = await platformCommand("sudo", ["--", paths.runtime, paths.entry, ...args], { cwd: paths.root, inherit: true });
@@ -3157,16 +3277,253 @@ export async function stopManaged(paths: AppPaths): Promise<void> {
 
 export async function restartManaged(paths: AppPaths): Promise<void> { await stopManaged(paths); await startManaged(paths); }
 
-/** Pure builders and validation helpers for tests; tests never register tasks/services or elevate. */
+/** 测试用纯构建器和校验辅助；真实计划任务验收仅在显式启用的 Windows 集成测试中执行。 */
 export const platformInternals = {
   quoteWindowsArg: platformQuoteWindowsArg, windowsArguments: platformWindowsArguments,
-  encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload,
+  encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload, powerShellProgram: platformPowerShellProgram,
   taskSpec: platformTaskSpec, buildTaskScript: platformBuildTaskScript, assessTask: platformAssessTask,
+  buildElevationScript: platformBuildElevationScript,
   systemdUnit: platformSystemdUnit, quoteSystemd: platformQuoteSystemd,
   systemdWorkingDirectory: platformSystemdWorkingDirectory,
   copyRegularTree: platformCopyRegularTree, linuxProtected: platformLinuxProtected,
   makeInstallMarker: platformMakeInstallMarker, installMarkerActive: platformInstallMarkerActive,
 };
+
+
+// ==================== ipv6.ts ====================
+import * as hostIpv6Fs from "node:fs";
+import * as hostIpv6Path from "node:path";
+
+/** 本机接口的 IPv6 开关状态；不代表该接口已获取地址或具有公网连通性。 */
+export interface HostIpv6Interface { name: string; enabled: boolean }
+/** 操作系统实际读取的状态；Linux 的新接口默认值与持久化值单独展示。 */
+export interface HostIpv6Status {
+  platform: NodeJS.Platform;
+  state: "enabled" | "disabled" | "mixed" | "unavailable";
+  interfaces: HostIpv6Interface[];
+  defaultEnabled: boolean | null;
+  persistedEnabled: boolean | null;
+  detail: string;
+}
+/** Linux sysctl 快照包含 all、default 及每个接口，便于失败时恢复不同的原值。 */
+export type HostIpv6LinuxSnapshot = Record<string, 0 | 1>;
+/** 所有系统写操作均可注入；自动测试不得修改宿主机的真实网络接口。 */
+export interface HostIpv6Dependencies {
+  platform: NodeJS.Platform;
+  isAdministrator: () => boolean;
+  powerShell: (script: string) => Promise<string>;
+  linuxRead: () => HostIpv6LinuxSnapshot;
+  linuxWrite: (name: string, disabled: 0 | 1) => void;
+  linuxReadPolicy: () => string | null;
+  linuxWritePolicy: (content: string | null) => void;
+}
+
+const hostIpv6ProcRoot = "/proc/sys/net/ipv6/conf";
+const hostIpv6PolicyFile = "/etc/sysctl.d/99-nexus-edge-ipv6.conf";
+const hostIpv6PolicyMarker = "# NexusEdge managed IPv6 interface policy";
+
+/**
+ * 校验内核返回的接口名，返回安全的 procfs 文件路径。
+ * name 不是命令片段；拒绝目录跳转、控制字符和分隔符后仅作为路径段使用。
+ */
+function hostIpv6ProcFile(name: string): string {
+  if (!name || name.length > 128 || name === "." || name === ".." || /[\\/\x00-\x1f\x7f]/.test(name)) throw new Error("Linux 返回了无法安全管理的网络接口名称。");
+  return hostIpv6Path.posix.join(hostIpv6ProcRoot, name, "disable_ipv6");
+}
+
+/** 读取全部真实接口以及 all/default；目录不存在表示内核未提供 IPv6 控制接口。 */
+function hostIpv6ReadLinux(): HostIpv6LinuxSnapshot {
+  if (!hostIpv6Fs.existsSync(hostIpv6ProcRoot)) return {};
+  const snapshot: HostIpv6LinuxSnapshot = {};
+  for (const name of hostIpv6Fs.readdirSync(hostIpv6ProcRoot).sort()) {
+    const file = hostIpv6ProcFile(name), stat = hostIpv6Fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`IPv6 控制文件不是普通 procfs 文件：${file}`);
+    const value = hostIpv6Fs.readFileSync(file, "utf8").trim();
+    if (value !== "0" && value !== "1") throw new Error(`IPv6 控制值无效：${name}`);
+    Object.defineProperty(snapshot, name, { value: Number(value), enumerable: true, writable: true, configurable: true });
+  }
+  return snapshot;
+}
+
+/** 将确定的 0/1 写入已有 procfs 文件，不创建文件、不调用 shell 或修改其他 sysctl。 */
+function hostIpv6WriteLinux(name: string, disabled: 0 | 1): void {
+  const file = hostIpv6ProcFile(name), stat = hostIpv6Fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`IPv6 控制文件无效：${file}`);
+  hostIpv6Fs.writeFileSync(file, `${disabled}\n`, { flag: "r+" });
+}
+
+/**
+ * 检查持久化目录及文件的所有者/权限，返回文件内容或 null。
+ * 只接受本工具标记的普通单链接文件，避免覆盖管理员已有的同名配置。
+ */
+function hostIpv6ReadPolicy(): string | null {
+  for (const directory of ["/", "/etc", "/etc/sysctl.d"]) {
+    const stat = hostIpv6Fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) throw new Error(`sysctl 目录必须由 root 管理且不可由普通用户写入：${directory}`);
+  }
+  let stat: ReturnType<typeof hostIpv6Fs.lstatSync>;
+  try { stat = hostIpv6Fs.lstatSync(hostIpv6PolicyFile); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== 0 || (stat.mode & 0o022) !== 0 || stat.size > 4096) throw new Error(`拒绝覆盖不安全的 IPv6 持久化文件：${hostIpv6PolicyFile}`);
+  const text = hostIpv6Fs.readFileSync(hostIpv6PolicyFile, "utf8");
+  if (!text.startsWith(hostIpv6PolicyMarker + "\n")) throw new Error(`同名 sysctl 文件不属于 NexusEdge，请先由管理员检查：${hostIpv6PolicyFile}`);
+  return text;
+}
+
+/** 仅原子替换或移除本工具的 sysctl 文件；content 为 null 表示回滚到原本不存在。 */
+function hostIpv6WritePolicy(content: string | null): void {
+  const before = hostIpv6ReadPolicy();
+  if (content === null) { if (before !== null) hostIpv6Fs.unlinkSync(hostIpv6PolicyFile); }
+  else atomicWrite(hostIpv6PolicyFile, content, 0o644);
+}
+
+/** 生成最小持久化策略：all 作用于现有接口，default 作用于之后出现的接口。 */
+function hostIpv6Policy(enabled: boolean): string {
+  const value = enabled ? 0 : 1;
+  return `${hostIpv6PolicyMarker}\nnet.ipv6.conf.all.disable_ipv6 = ${value}\nnet.ipv6.conf.default.disable_ipv6 = ${value}\n`;
+}
+
+/** 合并生产实现与测试替身；调用方不传路径，特权写入位置固定在模块内部。 */
+function hostIpv6Dependencies(overrides: Partial<HostIpv6Dependencies>): HostIpv6Dependencies {
+  return { platform: process.platform, isAdministrator, powerShell: platformPowerShell,
+    linuxRead: hostIpv6ReadLinux, linuxWrite: hostIpv6WriteLinux,
+    linuxReadPolicy: hostIpv6ReadPolicy, linuxWritePolicy: hostIpv6WritePolicy, ...overrides };
+}
+
+/** 根据各接口真实开关计算状态；不根据 Linux conf/all 的读值推断接口状态。 */
+function hostIpv6State(interfaces: HostIpv6Interface[]): HostIpv6Status["state"] {
+  if (!interfaces.length) return "unavailable";
+  if (interfaces.every(item => item.enabled)) return "enabled";
+  if (interfaces.every(item => !item.enabled)) return "disabled";
+  return "mixed";
+}
+
+/**
+ * 构造 Windows 查询/切换脚本。enabled 缺省时严格只读。
+ * 网卡由系统枚举后通过 CIM 对象传给 cmdlet，名称不会进入命令代码或通配符参数。
+ * 更新失败时逐个恢复快照中的绑定开关，并将回滚失败作为具体错误返回。
+ */
+function hostIpv6WindowsScript(enabled?: boolean): string {
+  const query = `
+function Get-IPv6Bindings {
+  @(Get-NetAdapterBinding -Name '*' -ComponentID 'ms_tcpip6' -IncludeHidden -AllBindings -ErrorAction Stop)
+}
+function Write-IPv6Status {
+  $items = @(Get-IPv6Bindings | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; enabled = [bool]$_.Enabled } })
+  ConvertTo-Json -InputObject $items -Compress -Depth 4
+}
+`;
+  if (enabled === undefined) return query + "Write-IPv6Status\n";
+  return query + `
+$desired = ${enabled ? "$true" : "$false"}
+$before = @(Get-IPv6Bindings | ForEach-Object { [pscustomobject]@{ binding = $_; enabled = [bool]$_.Enabled } })
+if ($before.Count -eq 0) { throw '未找到支持 ms_tcpip6 绑定的网络接口。' }
+try {
+  foreach ($item in $before) {
+    if ($item.enabled -ne $desired) { Set-NetAdapterBinding -InputObject $item.binding -Enabled $desired -Confirm:$false -ErrorAction Stop }
+  }
+  $after = @(Get-IPv6Bindings)
+  if ($after.Count -eq 0 -or @($after | Where-Object { [bool]$_.Enabled -ne $desired }).Count -gt 0) { throw '部分网络接口的 IPv6 绑定未达到目标状态。' }
+} catch {
+  $originalError = $_.Exception.Message
+  $rollbackErrors = @()
+  foreach ($item in $before) {
+    try { Set-NetAdapterBinding -InputObject $item.binding -Enabled $item.enabled -Confirm:$false -ErrorAction Stop }
+    catch { $rollbackErrors += ([string]$item.binding.Name + ': ' + $_.Exception.Message) }
+  }
+  if ($rollbackErrors.Count) { throw ($originalError + '；部分开关回滚失败：' + ($rollbackErrors -join '；')) }
+  throw ($originalError + '；已恢复操作前的接口开关，请检查网络管理器和原 IPv6 地址配置。')
+}
+Write-IPv6Status
+`;
+}
+
+/** 校验系统 PowerShell 返回的 JSON，不接受字符串布尔值或缺失名称。 */
+function hostIpv6WindowsStatus(text: string): HostIpv6Status {
+  let raw: unknown;
+  try { raw = JSON.parse(text.replace(/^\uFEFF/, "").trim()); }
+  catch { throw new Error("Windows IPv6 接口查询未返回有效 JSON。"); }
+  if (!Array.isArray(raw) || raw.length > 4096 || raw.some(item => !item || typeof item.name !== "string" || !item.name || typeof item.enabled !== "boolean")) throw new Error("Windows IPv6 接口查询返回了无效状态。");
+  const interfaces = raw.map(item => ({ name: item.name as string, enabled: item.enabled as boolean }));
+  return { platform: "win32", state: hostIpv6State(interfaces), interfaces, defaultEnabled: null, persistedEnabled: null,
+    detail: "管理当前网卡的 ms_tcpip6 绑定（包括隐藏网卡），开关由 Windows 保存；不改变 IPv4、回环 IPv6 或系统注册表。新增网卡需重新检查。" };
+}
+
+/** 将 Linux 快照及持久化内容转换为状态；缺少 all/default 时不能执行全局切换。 */
+function hostIpv6LinuxStatus(snapshot: HostIpv6LinuxSnapshot, policy: string | null): HostIpv6Status {
+  const interfaces = Object.entries(snapshot).filter(([name]) => name !== "all" && name !== "default").map(([name, disabled]) => ({ name, enabled: disabled === 0 }));
+  const persistedEnabled = policy === hostIpv6Policy(true) ? true : policy === hostIpv6Policy(false) ? false : null;
+  return { platform: "linux", state: hostIpv6State(interfaces), interfaces, defaultEnabled: snapshot.default === undefined ? null : snapshot.default === 0, persistedEnabled,
+    detail: interfaces.length ? `通过内核 sysctl 管理所有接口（含回环）及新接口默认值；持久化文件：${hostIpv6PolicyFile}。其他 sysctl 配置或网络管理器仍可能覆盖，重连后可在此重新检查。`
+      : "内核未提供 IPv6 接口控制项；可能未加载 IPv6 或使用 ipv6.disable=1 启动，无法通过此菜单开启。" };
+}
+
+/** 只读查询本机 IPv6 开关；返回接口、默认值和持久化状态，失败时抛出具体系统错误。 */
+export async function inspectHostIpv6(overrides: Partial<HostIpv6Dependencies> = {}): Promise<HostIpv6Status> {
+  const deps = hostIpv6Dependencies(overrides);
+  if (deps.platform === "win32") return hostIpv6WindowsStatus(await deps.powerShell(hostIpv6WindowsScript()));
+  if (deps.platform === "linux") {
+    const snapshot = deps.linuxRead();
+    return hostIpv6LinuxStatus(snapshot, Object.keys(snapshot).length ? deps.linuxReadPolicy() : null);
+  }
+  return { platform: deps.platform, state: "unavailable", interfaces: [], defaultEnabled: null, persistedEnabled: null, detail: "本机 IPv6 接口管理仅支持 Windows / Linux。" };
+}
+
+/**
+ * 设置全部本机接口的 IPv6 开关，enabled 必须为布尔值；返回重新读取的实际状态。
+ * 需要管理员/root 权限。Linux 先写自有持久化文件再改内核，失败恢复原策略及逐接口开关。
+ * 开关回滚不承诺恢复已被内核移除的静态地址或既有 TCP 连接。
+ */
+export async function setHostIpv6Enabled(enabled: boolean, overrides: Partial<HostIpv6Dependencies> = {}): Promise<HostIpv6Status> {
+  if (typeof enabled !== "boolean") throw new Error("IPv6 开关必须为 true 或 false。");
+  const deps = hostIpv6Dependencies(overrides);
+  if (deps.platform !== "win32" && deps.platform !== "linux") throw new Error("本机 IPv6 接口管理仅支持 Windows / Linux。");
+  if (!deps.isAdministrator()) throw new Error("修改本机 IPv6 网络接口需要管理员 / root 权限。");
+  if (deps.platform === "win32") {
+    const status = hostIpv6WindowsStatus(await deps.powerShell(hostIpv6WindowsScript(enabled)));
+    if (status.state !== (enabled ? "enabled" : "disabled")) throw new Error("Windows 返回的接口状态与目标不一致，请重新检查网卡或系统策略。");
+    return status;
+  }
+  const before = deps.linuxRead(), previousPolicy = deps.linuxReadPolicy();
+  if (before.all === undefined || before.default === undefined || !Object.keys(before).some(name => name !== "all" && name !== "default")) throw new Error("内核未提供完整 IPv6 控制项，未修改持久化配置。请检查 IPv6 模块及内核启动参数。");
+  const value = enabled ? 0 : 1;
+  let liveAttempted = false;
+  try {
+    // 先确认持久化可写；即使原子写入在重命名之后报错，也尝试恢复原文件。
+    deps.linuxWritePolicy(hostIpv6Policy(enabled));
+    liveAttempted = true;
+    deps.linuxWrite("all", value);
+    deps.linuxWrite("default", value);
+    const actual = deps.linuxRead();
+    if (Object.keys(actual).length < 3 || Object.values(actual).some(disabled => disabled !== value)) throw new Error("部分接口的 IPv6 开关未达到目标状态，可能被网络管理器覆盖。");
+    return hostIpv6LinuxStatus(actual, deps.linuxReadPolicy());
+  } catch (error) {
+    const failures: string[] = [];
+    // all 会同步覆盖其他接口，因此先恢复 all，再恢复 default 和每个接口的原值。
+    const ordered = liveAttempted ? ["all", "default", ...Object.keys(before).filter(name => name !== "all" && name !== "default")] : [];
+    for (const name of ordered) {
+      try { deps.linuxWrite(name, before[name]!); }
+      catch (rollbackError) { failures.push(`${name}：${errorMessage(rollbackError)}`); }
+    }
+    try { deps.linuxWritePolicy(previousPolicy); }
+    catch (rollbackError) { failures.push(`持久化策略：${errorMessage(rollbackError)}`); }
+    throw new Error(`IPv6 切换失败：${errorMessage(error)}；${failures.length ? `部分开关回滚失败：${failures.join("；")}` : "已恢复原接口开关和持久化策略，请检查原 IPv6 地址配置。"}`);
+  }
+}
+
+/**
+ * 特权辅助入口只接受一个 enable/disable 参数；无外部路径、接口名或配置读取。
+ * args 为 --host-ipv6 之后的参数，返回成功退出码 0，错误由主入口统一报告。
+ */
+export async function runHostIpv6Helper(args: string[], overrides: Partial<HostIpv6Dependencies> = {}): Promise<number> {
+  if (args.length !== 1 || !["enable", "disable"].includes(args[0]!)) throw new Error("IPv6 辅助程序仅接受 enable 或 disable。");
+  const status = await setHostIpv6Enabled(args[0] === "enable", overrides);
+  console.log(`本机 IPv6 接口已${status.state === "enabled" ? "开启" : "禁用"}。`);
+  return 0;
+}
+
+/** 纯脚本与解析器供测试使用；不直接执行任何系统操作。 */
+export const hostIpv6Internals = { windowsScript: hostIpv6WindowsScript, windowsStatus: hostIpv6WindowsStatus, linuxStatus: hostIpv6LinuxStatus, policy: hostIpv6Policy, procFile: hostIpv6ProcFile };
 
 
 // ==================== firewall-linux.ts ====================
@@ -4218,7 +4575,8 @@ try {
 }
 `;
 
-const FIREWALL_WINDOWS_LOADER = String.raw`$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$e=[Console]::In.ReadToEnd()|ConvertFrom-Json;$p=$e.payload;& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($e.script))))`;
+// 隔离 PowerShell 7 遗留模块路径，避免 Windows PowerShell 5.1 自动加载不兼容模块。
+const FIREWALL_WINDOWS_LOADER = String.raw`$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$e=[Console]::In.ReadToEnd()|ConvertFrom-Json;$p=$e.payload;& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($e.script))))`;
 
 function firewallWindowsCommand(paths: AppPaths, plan: FirewallPlan, operation: "inspect" | "apply") {
   const programs: string[] = [], warnings: string[] = [];
@@ -4950,7 +5308,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
       const command = options.tunnels?.[node.id] ?? (binaries.cloudflared ? { executable: binaries.cloudflared, args: [] } : undefined);
       if (!command) throw new Error(`未获取节点 ${node.name} 所需的 cloudflared。`);
       const metricsPort = await daemonFreePort(reservedPorts); metricsPorts.set(node.id, metricsPort);
-      const job: DaemonJob = { key: `cloudflared:${node.id}`, nodeId: node.id, command, args: buildCloudflaredArgs(node, runningPaths, metricsPort), state: initialState() };
+      const job: DaemonJob = { key: `cloudflared:${node.id}`, nodeId: node.id, command, args: buildCloudflaredArgs(node, runningPaths, metricsPort, isCoreIpv6Enabled(config)), state: initialState() };
       jobs.push(job); tunnelJobs.set(node.id, job);
     }
     atomicWrite(paths.runtimeState, JSON.stringify(runtime, null, 2) + "\n");
@@ -5630,6 +5988,65 @@ export async function uiValidatedInput(label: string, current: string, validate:
   }
 }
 
+
+
+// ==================== ipv6-panel.ts ====================
+
+/** 菜单依赖可替换，便于验证确认/取消/UAC 行为且不碰真实网络。 */
+export interface HostIpv6PanelServices {
+  inspect: () => Promise<HostIpv6Status>;
+  apply: (enabled: boolean) => Promise<HostIpv6Status>;
+  isAdministrator: () => boolean;
+  elevate: (paths: AppPaths, args: string[]) => Promise<void>;
+  menu: typeof selectMenu;
+  pause: typeof uiPause;
+  report: (message: string) => void;
+}
+
+/** 将实际接口状态格式化为菜单说明，明确区分接口开关、地址可达性及核心开关。 */
+export function hostIpv6Summary(status: HostIpv6Status): string {
+  const labels = { enabled: "全部开启", disabled: "全部禁用", mixed: "部分开启", unavailable: "当前无法管理" };
+  const lines = [`本机接口 IPv6：${labels[status.state]}`, ...status.interfaces.map(item => `  ${item.name}：${item.enabled ? "开启" : "禁用"}`)];
+  if (status.defaultEnabled !== null) lines.push(`新接口默认值：${status.defaultEnabled ? "开启" : "禁用"}`);
+  if (status.platform === "linux") lines.push(`本工具重启策略：${status.persistedEnabled === null ? "未设置或已被手工调整" : status.persistedEnabled ? "开启" : "禁用"}`);
+  lines.push(status.detail, "本机接口开关与“核心 IPv6”设置相互独立；开启接口不等于已取得可用的 IPv6 地址。");
+  return lines.join("\n");
+}
+
+/**
+ * 显示本机网络菜单。paths 只用于已验证单文件的 UAC/sudo 入口，不传给特权网络写入。
+ * 每次切换先明确确认，提权后重新查询实际接口；取消、权限不足均不伪报成功。
+ */
+export async function runHostIpv6Panel(paths: AppPaths, overrides: Partial<HostIpv6PanelServices> = {}): Promise<void> {
+  const services: HostIpv6PanelServices = { inspect: inspectHostIpv6, apply: setHostIpv6Enabled, isAdministrator, elevate: runElevated, menu: selectMenu, pause: uiPause, report: console.log, ...overrides };
+  for (;;) {
+    let status: HostIpv6Status;
+    try { status = await services.inspect(); }
+    catch (error) { services.report(`读取本机 IPv6 状态失败：${errorMessage(error)}`); await services.pause(); return; }
+    const choice = await services.menu("本机 IPv6 网络接口", hostIpv6Summary(status), ["禁用本机 IPv6 接口", "开启本机 IPv6 接口", "刷新状态", "返回"], 3);
+    if (choice === 3) return;
+    if (choice === 2) continue;
+    if (status.state === "unavailable") { services.report(status.detail); await services.pause(); continue; }
+    const enabled = choice === 1;
+    try {
+      const confirmed = await services.menu(enabled ? "开启本机 IPv6 接口" : "禁用本机 IPv6 接口", [
+        `将${enabled ? "开启" : "禁用"}此机器所有可管理接口的 IPv6，影响其他应用并保存到系统。`,
+        "网卡可能重连；当前 IPv6 远程管理或代理连接可能中断。禁用后原 IPv6 地址可能需要网络管理器重新配置。",
+        "需要管理员 / root 权限。此操作不自动改变核心 IPv6 设置。",
+      ].join("\n"), ["返回", `确认${enabled ? "开启" : "禁用"}`]);
+      if (confirmed === 0) continue;
+      if (services.isAdministrator()) status = await services.apply(enabled);
+      else { await services.elevate(paths, ["--host-ipv6", enabled ? "enable" : "disable"]); status = await services.inspect(); }
+      if (status.state !== (enabled ? "enabled" : "disabled") || (status.platform === "linux" && status.defaultEnabled !== enabled)) throw new Error("系统返回后，接口状态仍与目标不一致，请刷新检查网络管理器或系统策略。");
+      services.report(`已${enabled ? "开启" : "禁用"}本机 IPv6 网络接口。\n${hostIpv6Summary(status)}`);
+    } catch (error) {
+      if (error instanceof UiExitRequestedError) throw error;
+      if (error instanceof UserCancelledError) continue;
+      services.report(`本机 IPv6 操作未完成：${errorMessage(error)}`);
+    }
+    await services.pause();
+  }
+}
 
 
 // ==================== firewall-panel.ts ====================
@@ -6685,6 +7102,37 @@ async function panelStartup(paths: AppPaths, current: StartupStatus): Promise<bo
   return true;
 }
 
+/**
+ * 编辑核心出站 IPv6 策略，参数 paths 为当前安装路径，无返回值。
+ * 保存前核对配置指纹；立即应用复用核心预检流程，失败时保留旧配置和后台。
+ */
+async function panelCoreIpv6Settings(paths: AppPaths): Promise<void> {
+  const config = readConfig(paths), expected = configFingerprint(config);
+  const enabled = isCoreIpv6Enabled(config);
+  const choice = await selectMenu("核心出站 IPv6", `当前：${enabled ? "已开启（双栈）" : "已禁用（仅 IPv4，默认）"}。\n控制 sing-box / Xray 的 DNS、直连与 WARP 出站，以及 cloudflared 边缘连接。\n已有节点监听地址保持原值；本机网卡 IPv6 在独立菜单设置。`, ["禁用 IPv6（仅 IPv4）", "开启 IPv6（双栈）", "返回"], enabled ? 1 : 0);
+  if (choice === 2 || (choice === 1) === enabled) return;
+  const action = await selectMenu("应用核心 IPv6 设置", "立即应用会先检查核心配置，再重启节点；仅保存则在下次启动 / 重启时生效。", ["保存并应用", "仅保存，稍后重启", "取消"]);
+  if (action === 2) return;
+  if (configFingerprint(readConfig(paths)) !== expected) throw new Error("配置已在另一处修改，请重新打开核心 IPv6 设置。");
+  const candidate = { ...config, coreIpv6: choice === 1 };
+  if (action === 0 && candidate.nodes.some(node => node.enabled)) await panelApplyConfiguration(paths, candidate);
+  else {
+    writeConfig(paths, candidate);
+    console.log("核心 IPv6 设置已保存，下次启动 / 重启节点时生效。");
+  }
+}
+
+/** 网络设置子菜单；paths 指向当前安装，无返回值，系统接口操作独立于核心策略。 */
+async function panelNetworkSettings(paths: AppPaths): Promise<void> {
+  for (;;) {
+    const choice = await selectMenu("IPv6 / 防火墙设置", `核心出站 IPv6：${isCoreIpv6Enabled(readConfig(paths)) ? "已开启" : "已禁用（默认）"}`, ["核心出站 IPv6（开启 / 禁用）", "本机 IPv6 网络接口（开启 / 禁用）", "防火墙 / 端口放行", "返回"]);
+    if (choice === 3) return;
+    if (choice === 0) { await panelCoreIpv6Settings(paths); await uiPause(); }
+    else if (choice === 1) await runHostIpv6Panel(paths);
+    else await runFirewallPanel(paths);
+  }
+}
+
 export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
   if (!process.stdin.isTTY) throw new Error("管理面板需要交互式 PowerShell / cmd / Windows Terminal / Linux 终端。");
   for (;;) {
@@ -6697,10 +7145,11 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       `节点：${config.nodes.length} 个（${enabled.length} 个启用）    隧道：${enabled.filter(node => node.tunnel.mode !== "none").length} 个`,
       `自启：${startup.detail}`, `数据：${paths.data}`,
       firewallPanelSummary(paths, config),
+      `核心出站 IPv6：${isCoreIpv6Enabled(config) ? "已开启" : "已禁用（默认）"}`,
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "防火墙 / 端口放行", "退出面板（保留后台）"]);
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "退出面板（保留后台）"]);
     if (choice === 9) return "exit";
     try {
       if (choice === 0) {
@@ -6714,7 +7163,7 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       else if (choice === 5) console.log(tailLog(paths));
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
-      else if (choice === 8) { await runFirewallPanel(paths); continue; }
+      else if (choice === 8) { await panelNetworkSettings(paths); continue; }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;
@@ -6731,7 +7180,7 @@ import * as mainPath from "node:path";
 
 export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -6739,6 +7188,7 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   const version = Bun.version.split(".").map(Number);
   if ((version[0] ?? 0) < 1 || (version[0] === 1 && ((version[1] ?? 0) < 4 || (version[1] === 4 && (version[2] ?? 0) < 3)))) throw new Error("请使用 Bun 1.4.3 或更新版本。");
   const paths = createPaths(entry);
+  if (args[0] === "--host-ipv6") return runHostIpv6Helper(args.slice(1));
   if (args[0] === "--firewall-request") {
     if (args.length !== 2) throw new Error("防火墙辅助程序需要有效的单次请求 ID。");
     return runFirewallRequest(paths, args[1]!);

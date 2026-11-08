@@ -99,6 +99,49 @@ describe("Windows argument boundaries", () => {
     expect(JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"))).toEqual(value);
     expect(Buffer.from(platform.encodePowerShell("输出 '中文'"), "base64").toString("utf16le")).toBe("输出 '中文'");
   });
+
+  test("UAC helper windows stay hidden while the interactive panel remains visible", () => {
+    const paths = windowsPaths(String.raw`C:\用户 目录\O'Brien\NexusEdge`);
+    for (const args of [["--install-system", "request-id"], ["--host-ipv6", "disable"], ["--firewall-request", "request-id"], ["--update-system"]]) {
+      const script = platform.buildElevationScript(paths, args);
+      expect(script).toContain("-Verb RunAs -WindowStyle Hidden -PassThru -Wait");
+      expect(script).toContain("exit $child.ExitCode");
+      expect(script).toContain("exit 1223");
+      const encoded = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
+      const payload = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      expect(parseWindowsArguments(payload.arguments)).toEqual([paths.entry, ...args]);
+    }
+    expect(platform.buildElevationScript(paths, [])).toContain("-Verb RunAs -WindowStyle Normal -PassThru -Wait");
+  });
+});
+
+describe("Windows PowerShell module isolation", () => {
+  test("resets inherited PowerShell 7 module paths before any module can auto-load", () => {
+    const program = platform.powerShellProgram("Get-Acl -LiteralPath $p.root");
+    expect(program.startsWith("$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')\n")).toBe(true);
+    expect(program.indexOf("$env:PSModulePath")).toBeLessThan(program.indexOf("New-Object"));
+    expect(program).not.toContain("SetEnvironmentVariable");
+  });
+
+  test.skipIf(process.platform !== "win32")("Bun child loads the real Security module and writes ACLs despite an incompatible inherited module", () => {
+    const directory = temporaryDir();
+    const modules = path.join(directory, "foreign-modules");
+    const security = path.join(modules, "Microsoft.PowerShell.Security");
+    fs.mkdirSync(security, { recursive: true });
+    // 模拟优先于 5.1 系统模块的外部同名模块；不改变宿主机的模块或环境变量。
+    fs.writeFileSync(path.join(security, "Microsoft.PowerShell.Security.psm1"), "function Get-Acl { throw 'FOREIGN_SECURITY_MODULE' }; Export-ModuleMember -Function Get-Acl\n");
+    const powershell = path.win32.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "psmodulepath"));
+    env.PSModulePath = modules + ";" + path.dirname(powershell) + "\\Modules";
+    const script = platform.powerShellPayload({ root: directory }) + "$acl = Get-Acl -LiteralPath $p.root; Set-Acl -LiteralPath $p.root -AclObject $acl; (Get-Command Get-Acl).Module.Path";
+    const broken = cp.spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platform.encodePowerShell("$ErrorActionPreference = 'Stop'\n" + script)], { encoding: "utf8", windowsHide: true, timeout: 20000, env });
+    expect(broken.status).not.toBe(0);
+    expect(broken.stderr).toContain("Microsoft.PowerShell.Security");
+    const repaired = cp.spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platform.encodePowerShell(platform.powerShellProgram(script))], { encoding: "utf8", windowsHide: true, timeout: 20000, env });
+    if (repaired.status !== 0) throw new Error(repaired.error?.message || repaired.stderr || repaired.stdout);
+    expect(repaired.stdout.toLowerCase()).toContain("windowspowershell\\v1.0\\modules\\microsoft.powershell.security");
+    expect(repaired.stdout).not.toContain(modules);
+  });
 });
 
 describe("scheduled task definition", () => {
@@ -215,7 +258,9 @@ describe("actual task status validation", () => {
 
 describe("Linux service definition", () => {
   test("keeps worker in the service cgroup, preserves argv and does not revive clean shutdowns", () => {
-    const paths = createPaths('/opt/a path/$name%foo/"quoted"/nexus-edge.ts', "/opt/a path/runtime/bun");
+    // 此处验证 Linux 生成器，显式固定 POSIX 路径，避免 Windows 宿主把 /opt 解析成 C:\\opt。
+    const root = '/opt/a path/$name%foo/"quoted"';
+    const paths = { ...createPaths(path.join(temporaryDir(), "nexus-edge.ts")), root, entry: root + "/nexus-edge.ts", runtime: "/opt/a path/runtime/bun" };
     const unit = platform.systemdUnit(paths);
     expect(unit).toContain("Type=simple\nUser=root\n");
     expect(unit).toContain('ExecStart="/opt/a path/runtime/bun" "/opt/a path/$$name%%foo/\\"quoted\\"/nexus-edge.ts" "--worker"');

@@ -6,6 +6,7 @@ import * as daemonNet from "node:net";
 import * as daemonHttp from "node:http";
 import * as daemonDgram from "node:dgram";
 import * as daemonSqlite from "bun:sqlite";
+import { isCoreIpv6Enabled } from "./core.ts";
 import { type AppConfig, type AppPaths, type RuntimeRecord, type DaemonStatus, type NodeConfig, type NodeRuntimeStatus, type CoreName, type CoreRuntimeStatus, type CoreProcessState, atomicWrite, ensureDataDir, readConfig, validateConfig, configFingerprint, runtimeConfigFingerprint, collectConfigSecrets, generateNodeLinks, nodeEngine, nodeListenNetworks, normalizeDomain, LineBuffer, redact, errorMessage, delay } from "./core.ts";
 import { ensureBinaries, preflightCores, buildCloudflaredArgs, readCoreSelection, initializeCoreSelection, coreReleaseFingerprint, type Binaries } from "./network.ts";
 import { syncFirewallBackground } from "./firewall-control.ts";
@@ -432,7 +433,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
       const command = options.tunnels?.[node.id] ?? (binaries.cloudflared ? { executable: binaries.cloudflared, args: [] } : undefined);
       if (!command) throw new Error(`未获取节点 ${node.name} 所需的 cloudflared。`);
       const metricsPort = await daemonFreePort(reservedPorts); metricsPorts.set(node.id, metricsPort);
-      const job: DaemonJob = { key: `cloudflared:${node.id}`, nodeId: node.id, command, args: buildCloudflaredArgs(node, runningPaths, metricsPort), state: initialState() };
+      const job: DaemonJob = { key: `cloudflared:${node.id}`, nodeId: node.id, command, args: buildCloudflaredArgs(node, runningPaths, metricsPort, isCoreIpv6Enabled(config)), state: initialState() };
       jobs.push(job); tunnelJobs.set(node.id, job);
     }
     atomicWrite(paths.runtimeState, JSON.stringify(runtime, null, 2) + "\n");
