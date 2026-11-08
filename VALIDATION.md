@@ -2,6 +2,19 @@
 
 验证日期：2026-11-08。当前开发与现场环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3；下方 2.3.0 报告属于历史记录，不计入本次结果。
 
+## 当前结果
+
+| 检查 | 结果 |
+| --- | --- |
+| Windows 全量测试（启用固定官方核心和真实任务测试） | **522 通过、47 跳过、0 失败**；569 项，3045 断言 |
+| TypeScript 类型检查、单文件构建、Git 空白检查 | **通过** |
+| 本机系统安装迁移 | **通过**；SYSTEM 开机任务已启用且运行，后台 ready，旧后台全部退出 |
+| 配置和安装保护 | **通过**；节点/凭据保持，安装路径 ACL 验证通过 |
+| 本机 IPv6 策略 | **通过**；真实运行配置强制 IPv4、IPv4 DNS、显式 IPv6 阻断，REALITY 运行目标为 IPv4 |
+| Linux CI / PTY / 实核 namespace 测试 | 已准备工作流，待仓库邀请接受并推送后执行；**尚未计为通过** |
+
+Windows 全量运行已包含真实协议回环、REALITY IPv4 运行目标和计划任务测试，不重复累计之前单独运行的数量。47 个跳过项为 Linux/POSIX、未设置的 PowerShell 模拟器或缺少额外官方压缩包样本的用例。测试结束仅保留实际用户服务的 worker、core-host 和 Xray，无调试进程或临时任务遗留。
+
 ## 验证范围
 
 - 新旧配置的核心 IPv6 默认关闭、显式双栈开关、运行指纹和凭据保留。
@@ -34,6 +47,14 @@ bun test tests/network.test.ts tests/real-proxy.test.ts tests/core-ipv6-real.tes
 ```
 
 跨平台自动测试见 `.github/workflows/test.yml`。Linux 防火墙文件权限与锁测试只在 Linux 运行，Windows 的 POSIX 跳过不代表覆盖已通过。样本缺失导致的跳过数应与通过数分别报告。
+
+Linux 真实接口与持久化测试可独立运行：
+
+```bash
+sudo "$(command -v bun)" tests/fixtures/ipv6-linux-namespace.ts
+```
+
+该脚本建立独立网络/挂载命名空间，确认只有回环接口后挂载临时 sysctl.d，调用生产开关并用 `sysctl -p` 重载；退出后核对宿主开关和持久化文件完全不变。不要直接在生产机器执行 helper 来代替此隔离测试。
 
 ---
 

@@ -194,7 +194,7 @@ TCP 就绪检查本机监听；UDP 检查端口绑定与核心存活；隧道还
 | sing-box | 域名只解析 IPv4；拒绝客户端请求的显式 IPv6 目标 |
 | Xray | 直连强制 IPv4 解析；拒绝显式 IPv6 目标 |
 | WARP | 生成的接口地址和允许网段仅含 IPv4；目标及对端解析使用 IPv4；保存的双栈凭据保留 |
-| REALITY | 目标握手使用 IPv4；显式 IPv6 目标需先开启核心 IPv6 或调整目标 |
+| REALITY | 目标握手使用 IPv4；Xray 在每次启动预检时解析并固定本次运行的 IPv4 目标，保留原域名/SNI；显式 IPv6 目标需先开启核心 IPv6 或调整目标 |
 | cloudflared | 边缘连接使用 `--edge-ip-version 4`；开启后恢复 `auto` |
 
 此开关管理服务端核心出站，不重写已有监听地址、客户端连接地址或回环 origin，也不改其他应用的网卡设置。仅有 IPv6 地址的 WARP 配置会在启动预检时给出明确提示。导出的客户端继续使用其所在机器的网络能力。
@@ -273,7 +273,7 @@ sing-box 用 WireGuard endpoint，Xray 用用户态 WireGuard。本脚本不创�
 
 | 平台 | 实现 | 自启 | 验证范围 |
 | --- | --- | --- | --- |
-| Windows x64 | 下载、后台、面板 | SYSTEM 开机 / 当前用户登录 | 命令与任务结构；待真机验收 |
+| Windows x64 | 下载、后台、面板 | SYSTEM 开机 / 当前用户登录 | 真实核心回环、用户/SYSTEM任务、系统安装迁移已验收；未重启整机 |
 | Linux x64 | 下载、后台、面板 | systemd | 已执行真实核心、进程、终端测试 |
 | Linux arm64 | 对应下载与配置分支 | systemd | 包哈希和映射；待 ARM64 真机验收 |
 
@@ -400,6 +400,7 @@ Windows 系统任务名 `NexusEdge-System`，用户任务 `NexusEdge-User-<目�
 | `src/network.ts` | 官方版本查询、版本选择、下载 / 哈希、服务端配置、TLS / ENC、WARP |
 | `src/daemon.ts` | 多节点守护、按需进程、隧道恢复、IPC、就绪 |
 | `src/platform.ts` | Windows 任务 / ACL、Linux systemd、安装升级 |
+| `src/ipv6.ts`、`src/ipv6-panel.ts` | 本机接口 IPv6 状态、切换、持久化、回滚与菜单 |
 | `src/firewall.ts` | 有限端口计划、Windows Defender Firewall、规则校验与状态记录 |
 | `src/firewall-linux.ts` | UFW、firewalld、iptables / ip6tables、归属与迁移 |
 | `src/firewall-control.ts` | UAC / sudo 单次请求、权限检查、后台同步 |
