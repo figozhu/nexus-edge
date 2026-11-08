@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 2.3.1 — IPv4-first cores, IPv6 controls and reliable Windows startup.
+ * NexusEdge 2.3.2 — 按需编辑节点、REALITY 单次域名输入与跨平台终端交互。
  * Run: bun nexus-edge.ts
  * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.
  * Generated from the typed source modules using scripts/build.ts.
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.1";
+export const APP_VERSION = "2.3.2";
 
 export interface WarpProfile {
   privateKey: string;
@@ -6337,7 +6337,13 @@ export async function repairNodeAddress(paths: AppPaths, nodeId: string, overrid
   return current;
 }
 
-async function simpleAuthentication(node: NodeConfig): Promise<void> {
+/** 根据协议返回认证分组标题；只列出实际使用的凭据，避免无关 UUID 提示。 */
+export function nodeAuthenticationLabel(node: NodeConfig): string {
+  return `名称与${["vless", "vmess"].includes(node.protocol) ? " UUID" : node.protocol === "tuic" ? " UUID / 密码" : ["socks", "naive"].includes(node.protocol) ? "用户名 / 密码" : "密码"}`;
+}
+
+/** 编辑传入草稿的名称与认证；只处理用户选择的字段，返回 Promise<void>，不写入配置。 */
+export async function editNodeAuthentication(node: NodeConfig): Promise<void> {
   const hasUuid = ["vless", "vmess", "tuic"].includes(node.protocol);
   const hasUser = ["socks", "naive"].includes(node.protocol);
   const hasPassword = !["vless", "vmess"].includes(node.protocol);
@@ -6398,7 +6404,8 @@ async function simpleTunnel(node: NodeConfig): Promise<{ node: NodeConfig; prepa
 }
 
 function simpleSummary(paths: AppPaths, config: AppConfig, node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
-  const security = node.tls.mode === "reality" ? `REALITY（目标 ${node.tls.serverName}，密钥已准备）`
+  const realityHost = node.tls.reality.handshakeServer;
+  const security = node.tls.mode === "reality" ? `REALITY（握手目标 ${realityHost.includes(":") ? `[${realityHost}]` : realityHost}:${node.tls.reality.handshakePort}；SNI ${node.tls.serverName}${realityHost === node.tls.serverName ? "，同目标域名" : "，独立设置"}）`
     : node.tls.mode === "tls" ? node.tls.certificatePem ? `TLS（已有证书，名称 ${node.tls.serverName}）` : "TLS（保存时自动生成独立证书，无需自备域名）"
     : node.protocol === "vless" ? prepareEncryption ? "ENC（保存时自动生成加密参数）" : node.vlessEncryption !== "none" ? "VLESS ENC" : "无附加 TLS / ENC"
     : node.protocol === "socks" ? "SOCKS5 用户名 / 密码认证" : node.protocol === "vmess" && ["none", "zero"].includes(node.vmessSecurity) ? "VMess 未开启协议加密 / TLS（已有高级配置）" : "协议自身加密";
@@ -6436,7 +6443,7 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
   }
   for (;;) {
     const items = ["apply", "save", ...(["vless", "vmess"].includes(node.protocol) ? ["tunnel"] : []), "address", "auth", "advanced", "cancel"];
-    const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: "名称与 UUID / 密码", advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
+    const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: nodeAuthenticationLabel(node), advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
     const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(paths, config, node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
     if (selected === "cancel") throw new UserCancelledError();
     try {
@@ -6444,9 +6451,15 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
         const changed = await simpleTunnel(node); node = changed.node; notice = changed.notice;
         prepareEncryption = (prepareEncryption || changed.prepareEncryption) && node.tunnel.mode !== "none" && node.direct && node.vlessEncryption === "none";
       } else if (selected === "address") node = await editConnectionAddress(node, service, newDraft);
-      else if (selected === "auth") await simpleAuthentication(node);
+      else if (selected === "auth") {
+        // 分组使用副本，Esc 返回时不把只完成一半的名称/凭据带回摘要。
+        const draft = structuredClone(node); await editNodeAuthentication(draft); node = draft;
+      }
       else if (selected === "advanced") {
         if (prepareEncryption) { console.log("先准备已选择的 VLESS ENC 加密参数……"); Object.assign(node, await service.encryption(paths)); prepareEncryption = false; }
+        // 交接前核对最初读取的节点，防止高级编辑把较新的磁盘版本误当作旧草稿的保存基线。
+        const current = readConfig(paths).nodes.find(item => item.id === node.id);
+        if (JSON.stringify(current) !== JSON.stringify(original)) throw new Error("这个节点已在另一处修改，请退出后重新打开，避免覆盖新设置。");
         await actions.advanced(structuredClone(node)); return;
       }
       else if (selected === "save" || selected === "apply") {
@@ -6635,6 +6648,7 @@ export async function runCorePanel(paths: AppPaths, overrides: Partial<CorePanel
 import * as panelFs from "node:fs";
 import * as panelPath from "node:path";
 import * as panelCrypto from "node:crypto";
+import * as panelNet from "node:net";
 
 const panelProtocolLabels: Record<NodeProtocol, string> = {
   vless: "VLESS", vmess: "VMess", shadowsocks: "Shadowsocks / SS2022", trojan: "Trojan",
@@ -6656,10 +6670,6 @@ async function panelInteger(label: string, current: number, minimum = 1, maximum
 }
 async function panelEnum<T extends string>(label: string, help: string, values: readonly T[], current: T, labels: readonly string[] = values): Promise<T> {
   return values[await selectMenu(label, help, [...labels], Math.max(0, values.indexOf(current)))]!;
-}
-async function panelPassword(node: NodeConfig): Promise<string> {
-  const value = await promptInput("密码（回车保留；输入 new 重新生成）", node.password, { secret: true });
-  return value === "new" ? node.protocol === "shadowsocks" ? generateShadowsocksPassword(node.method) : panelCrypto.randomBytes(24).toString("base64url") : value;
 }
 function panelReadPem(filename: string): string {
   const path = filename.trim().replace(/^"(.*)"$/, "$1");
@@ -6686,74 +6696,139 @@ async function panelWarp(config: AppConfig): Promise<AppConfig> {
   return { ...config, warp: await registerWarp() };
 }
 
-async function panelSecurity(paths: AppPaths, node: NodeConfig): Promise<void> {
-  const previousSecurity = node.tls.mode;
-  const plainOnly = ["shadowsocks", "socks"].includes(node.protocol) || node.tunnel.mode !== "none";
-  if (plainOnly) { node.tls.mode = "none"; node.flow = ""; return; }
-  const allowed: NodeConfig["tls"]["mode"][] = node.protocol === "vless" ? node.transport.type === "ws" ? ["none", "tls"] : ["none", "tls", "reality"]
-    : node.protocol === "anytls" ? ["tls", "reality"] : node.protocol === "vmess" ? ["none", "tls"] : ["tls"];
-  node.tls.mode = await panelEnum("节点安全层", "TLS 可以导入证书或生成自签证书；REALITY 使用握手目标与密钥。", allowed, node.tls.mode,
-    allowed.map(value => value === "none" ? "不附加 TLS" : value === "tls" ? "TLS 证书" : "REALITY"));
-  if (node.tls.mode === "none") { node.flow = ""; return; }
-  const suggestedName = node.tls.mode === "reality" ? node.tls.serverName || node.tls.reality.handshakeServer : node.tls.serverName || node.address || "nexus.local";
-  console.log(node.tls.mode === "reality"
-    ? "SNI 是 REALITY 目标网站的域名，需要与下面的握手目标匹配；不是 VPS 的 IP，也不要求你拥有这个域名。"
-    : "SNI 是证书对应的名称，不是本机监听 IP。使用自动证书时保留已有名称即可；使用自己的证书时填证书覆盖的域名。"
-  );
-  node.tls.serverName = await uiValidatedInput("TLS / REALITY 服务器名称（SNI；通常保留）", suggestedName, value => {
-    const result = node.tls.mode === "reality" ? normalizeDomain(value) : normalizeConnectAddress(value);
-    if (!result) throw new Error("请填写服务器名称或证书 IP。"); return result;
-  });
-  if (node.tls.mode === "reality") {
-    node.tls.insecure = false;
-    node.tls.reality.handshakeServer = await uiValidatedInput("REALITY 握手目标主机（支持 TLS 1.3 的真实站点）", node.tls.reality.handshakeServer || node.tls.serverName, value => {
-      const result = normalizeConnectAddress(value); if (!result) throw new Error("握手目标不能为空。"); return result;
-    });
-    node.tls.reality.handshakePort = await panelInteger("REALITY 握手目标端口", node.tls.reality.handshakePort);
-    const hasKey = Boolean(node.tls.reality.privateKey);
-    const choices = [...(hasKey ? ["保留已有 REALITY 密钥"] : []), "生成新的 REALITY 密钥对", "输入自己的 REALITY 私钥"];
-    const action = await selectMenu("REALITY 密钥", "公钥会从私钥派生，用于生成客户端配置；私钥只保存在服务端配置中。", choices);
-    const offset = hasKey ? 1 : 0;
-    if (action === offset) Object.assign(node.tls.reality, generateRealityKeyPair());
-    if (action === offset + 1) {
-      node.tls.reality.privateKey = await uiValidatedInput("REALITY 私钥", node.tls.reality.privateKey, value => { deriveRealityPublicKey(value); return value; }, { secret: true });
-      node.tls.reality.publicKey = deriveRealityPublicKey(node.tls.reality.privateKey);
-    }
-    node.tls.reality.shortId = await uiValidatedInput("REALITY Short ID（偶数位十六进制，最长 16 位；- 留空）", node.tls.reality.shortId || (hasKey ? "" : panelCrypto.randomBytes(8).toString("hex")), value => {
-      if (!/^(?:[0-9a-fA-F]{2}){0,8}$/.test(value)) throw new Error("Short ID 须为 0–16 位偶数长度的十六进制。"); return value.toLowerCase();
-    }, { clearable: true });
-  } else {
-    const hasCertificate = Boolean(node.tls.certificatePem && node.tls.keyPem);
-    const selfSignedDescription = node.protocol === "vless" ? "生成自签证书（客户端固定证书指纹）" : node.protocol === "naive" ? "生成自签证书（客户端信任此证书）" : "生成自签证书（客户端跳过 CA 校验）";
-    const choices = [...(hasCertificate ? ["保留已有证书与私钥"] : []), "导入 PEM 证书与私钥文件", selfSignedDescription];
-    const action = await selectMenu("TLS 证书", "证书与私钥内容会随节点配置保存，系统安装迁移时会一并复制。", choices);
-    const offset = hasCertificate ? 1 : 0;
-    if (action === offset) {
-      node.tls.certificatePem = panelReadPem(await promptInput("PEM 证书文件路径"));
-      node.tls.keyPem = panelReadPem(await promptInput("PEM 私钥文件路径"));
-      node.tls.insecure = false;
-    }
-    if (action === offset + 1) {
-      console.log("使用对应官方核心生成自签证书……");
-      Object.assign(node.tls, await generateSelfSignedCertificate(paths, node));
-      node.tls.insecure = true;
-    }
-    const localTrust = node.protocol === "vless" ? "固定此证书的 SHA-256 指纹（自签证书）" : node.protocol === "naive" ? "将此证书加入客户端信任配置（自签证书）" : "跳过 CA 校验（自签证书）";
-    const trustHelp = node.protocol === "vless" ? "Xray 使用当前证书指纹校验自签证书。更换证书后，需要重新导出客户端配置。" : node.protocol === "naive" ? "Naive 自签模式在客户端 JSON 中内嵌公开证书，私钥不会导出。证书名称仍须匹配 SNI。" : "受信任证书建议严格校验；自签证书可使用跳过 CA 校验的客户端配置。";
-    node.tls.insecure = (await selectMenu("客户端证书校验", trustHelp, ["使用系统受信任的 CA 校验证书", localTrust], node.tls.insecure ? 1 : 0)) === 1;
-  }
-  const suggestedAlpn = node.protocol === "hysteria2" || node.protocol === "tuic" ? "h3" : node.transport.type === "ws" ? "http/1.1" : node.transport.type === "grpc" || node.protocol === "naive" ? "h2" : "h2,http/1.1";
-  const alpn = await promptInput("ALPN（英文逗号分隔；输入 - 留空交给核心）", node.tls.alpn.join(",") || (previousSecurity === "none" ? suggestedAlpn : ""), { clearable: true });
-  node.tls.alpn = alpn ? alpn.split(",").map(value => value.trim()).filter(Boolean) : [];
+/** 高级编辑依赖：正式使用官方核心；终端测试注入本地证书/ENC，避免下载与启动服务。 */
+export interface PanelEditorServices {
+  certificate: typeof generateSelfSignedCertificate;
+  encryption: typeof generateVlessEncryption;
 }
 
-/** Public for the real terminal workflow regression; it only saves after a final summary. */
-export async function configureNode(paths: AppPaths, existing?: NodeConfig): Promise<void> {
-  let config = readConfig(paths);
-  const protocol = await panelEnum("选择节点协议 · 高级模式", "这里逐项自定义配置。通常可返回节点管理使用简易模式；编辑时回车保留已有参数。", NODE_PROTOCOLS, existing?.protocol ?? "vless", NODE_PROTOCOLS.map(item => panelProtocolLabels[item]));
-  let node = existing?.protocol === protocol ? structuredClone(existing) : createDefaultNode(protocol, config.nodes.filter(item => item.id !== existing?.id));
-  if (existing && existing.protocol !== protocol) { node.id = existing.id; node.name = existing.name; }
-  node.name = await promptInput("节点名称", node.name);
+/** 返回握手目标与 SNI 摘要；node 是草稿，客户端名称不可误标为服务端连接目标。 */
+export function panelRealitySummary(node: NodeConfig): string {
+  const r = node.tls.reality;
+  const host = r.handshakeServer.includes(":") ? `[${r.handshakeServer}]` : r.handshakeServer;
+  return `握手目标：${host}:${r.handshakePort}\n客户端 SNI：${node.tls.serverName}${r.handshakeServer === node.tls.serverName ? "（与目标域名相同）" : "（独立设置）"}`;
+}
+
+/** 返回规范化的 REALITY 域名；拒绝空值和 IP，避免保存时才发现 SNI 输入错误。 */
+function panelRealityDomain(value: string): string {
+  const domain = normalizeDomain(value);
+  if (!domain || panelNet.isIP(domain)) throw new Error("SNI 必须是目标站点证书支持的域名，不能填写 IP。");
+  return domain;
+}
+
+/** 仅修改草稿 ALPN；空字符串交给核心协商，立即验证格式，返回值为 void。 */
+async function panelAlpn(node: NodeConfig): Promise<void> {
+  const value = await uiValidatedInput("ALPN（英文逗号分隔；- 交给核心协商）", node.tls.alpn.join(","), value => {
+    const tokens = value ? value.split(",").map(item => item.trim()) : [];
+    if (tokens.length > 8 || tokens.some(item => !/^[\x21-\x7e]{1,255}$/.test(item))) throw new Error("ALPN 最多 8 项，每项须为非空 ASCII 标识。");
+    return tokens.join(",");
+  }, { clearable: true });
+  node.tls.alpn = value ? value.split(",") : [];
+}
+
+/**
+ * 按需编辑 REALITY 草稿。常用入口只输入一次域名，同步握手目标与 SNI；
+ * 独立入口保留目标 IP、自定义端口和不同 SNI。已有空 Short ID 和密钥不自动轮换。
+ */
+async function panelReality(node: NodeConfig): Promise<void> {
+  const r = node.tls.reality;
+  if (!r.handshakeServer) { r.handshakeServer = "apple.com"; node.tls.serverName = "apple.com"; }
+  if (!node.tls.serverName && !panelNet.isIP(r.handshakeServer)) node.tls.serverName = r.handshakeServer;
+  if (!r.privateKey) { Object.assign(r, generateRealityKeyPair()); r.shortId ||= panelCrypto.randomBytes(8).toString("hex"); }
+  else if (!r.publicKey) r.publicKey = deriveRealityPublicKey(r.privateKey);
+  node.tls.insecure = false;
+  for (;;) {
+    const selected = await selectMenu("REALITY 设置", `${panelRealitySummary(node)}\n握手目标是服务器实际连接的站点；SNI 是客户端握手时声明的证书域名。\n通常两者相同，修改一次即可；目标为 IP 或需要独立 SNI 时才分别设置。\n密钥已准备；Short ID：${r.shortId || "空（有效配置）"}；ALPN：${node.tls.alpn.join(",") || "核心自动协商"}`, [
+      "完成，返回节点摘要", "修改目标域名（自动同步 SNI）", "分别设置握手目标 / 端口 / SNI", "密钥与 Short ID", "修改 ALPN",
+    ]);
+    if (selected === 0) return;
+    if (selected === 1) {
+      const domain = await uiValidatedInput("REALITY 目标域名（同时用作 SNI）", panelNet.isIP(r.handshakeServer) ? node.tls.serverName : r.handshakeServer, panelRealityDomain);
+      r.handshakeServer = domain; node.tls.serverName = domain;
+    } else if (selected === 2) {
+      const target = await uiValidatedInput("服务器连接的握手目标（域名或 IP）", r.handshakeServer, value => {
+        const host = normalizeConnectAddress(value); if (!host) throw new Error("握手目标不能为空。"); return host;
+      });
+      const port = await panelInteger("握手目标端口（不是节点监听端口）", r.handshakePort);
+      const sni = await uiValidatedInput("客户端 SNI（目标证书支持的域名，可与连接目标不同）", node.tls.serverName, panelRealityDomain);
+      // 三项输入完成后一起写入；输入中断时不留半组目标/SNI。
+      r.handshakeServer = target; r.handshakePort = port; node.tls.serverName = sni;
+    } else if (selected === 3) {
+      const action = await selectMenu("REALITY 密钥", "公钥由私钥派生；私钥不会导出。更换密钥或 Short ID 后需重新导入客户端配置。", ["保留已有密钥", "生成新的 REALITY 密钥对", "输入自己的 REALITY 私钥"]);
+      if (action === 1) Object.assign(r, generateRealityKeyPair());
+      if (action === 2) {
+        r.privateKey = await uiValidatedInput("REALITY 私钥", r.privateKey, value => { deriveRealityPublicKey(value); return value; }, { secret: true });
+        r.publicKey = deriveRealityPublicKey(r.privateKey);
+      }
+      r.shortId = await uiValidatedInput("REALITY Short ID（偶数位十六进制，最长 16 位；- 留空）", r.shortId, value => {
+        if (!/^(?:[0-9a-fA-F]{2}){0,8}$/.test(value)) throw new Error("Short ID 须为 0–16 位偶数长度的十六进制。"); return value.toLowerCase();
+      }, { clearable: true });
+    } else await panelAlpn(node);
+  }
+}
+
+/** 按协议编辑草稿安全层；只有一种合法模式时跳过选择，已有证书与密钥默认保留。 */
+async function panelSecurity(paths: AppPaths, node: NodeConfig, service: PanelEditorServices): Promise<void> {
+  const allowed: NodeConfig["tls"]["mode"][] = node.protocol === "vless" ? node.transport.type === "ws" ? ["none", "tls"] : ["none", "tls", "reality"]
+    : node.protocol === "anytls" ? ["tls", "reality"] : node.protocol === "vmess" ? ["none", "tls"] : ["tls"];
+  node.tls.mode = allowed.length === 1 ? allowed[0]! : await panelEnum("节点安全层", "TLS 使用本节点证书；REALITY 使用真实站点的握手目标和密钥。", allowed, node.tls.mode,
+    allowed.map(value => value === "none" ? "不附加 TLS" : value === "tls" ? "TLS 证书" : "REALITY"));
+  if (node.tls.mode === "none") { node.flow = ""; return; }
+  if (node.tls.mode === "reality") { await panelReality(node); return; }
+  // 旧证书允许空 SNI（导出时使用连接地址）；仅为尚无证书的新安全层补自动证书名称。
+  if (!node.tls.serverName && !node.tls.certificatePem && !node.tls.keyPem) node.tls.serverName = "nexus.local";
+  for (;;) {
+    const selected = await selectMenu("TLS 设置", `证书名称（SNI）：${node.tls.serverName || "跟随客户端连接地址"}\n证书：${node.tls.certificatePem && node.tls.keyPem ? "已有证书与私钥" : "尚未准备；新节点保存时自动生成"}\n客户端校验：${node.tls.insecure ? "自签证书模式" : "系统受信任 CA"}\nALPN：${node.tls.alpn.join(",") || "核心自动协商"}\nSNI 是证书覆盖的域名或 IP，不是本机监听地址。自动证书无需自备域名。\n修改 SNI 不会重签已有证书；新名称需由当前证书覆盖，必要时重新生成或导入。`, [
+      "完成，返回节点摘要", "修改证书名称（TLS SNI）", "导入 PEM 证书与私钥", "生成新的自签证书", "客户端证书校验", "修改 ALPN",
+    ]);
+    if (selected === 0) return;
+    if (selected === 1) node.tls.serverName = await uiValidatedInput("TLS 证书名称（SNI）", node.tls.serverName, value => {
+      const result = normalizeConnectAddress(value); if (!result) throw new Error("请填写证书覆盖的域名或 IP。"); return result;
+    });
+    if (selected === 2) {
+      const certificatePem = panelReadPem(await promptInput("PEM 证书文件路径"));
+      const keyPem = panelReadPem(await promptInput("PEM 私钥文件路径"));
+      validateNode({ ...node, tls: { ...node.tls, certificatePem, keyPem } }, { allowIncomplete: true });
+      Object.assign(node.tls, { certificatePem, keyPem, insecure: false });
+    }
+    if (selected === 3) {
+      console.log("正在生成此节点的自签证书……");
+      Object.assign(node.tls, await service.certificate(paths, node), { insecure: true });
+    }
+    if (selected === 4) {
+      const localTrust = node.protocol === "vless" ? "固定证书 SHA-256 指纹（自签）" : node.protocol === "naive" ? "将证书加入客户端信任配置（自签）" : "跳过 CA 校验（自签）";
+      node.tls.insecure = (await selectMenu("客户端证书校验", "受信任证书使用系统 CA；自签证书使用对应的客户端信任方式。更换证书后需重新导出配置。", ["使用系统受信任的 CA 校验证书", localTrust], node.tls.insecure ? 1 : 0)) === 1;
+    }
+    if (selected === 5) await panelAlpn(node);
+  }
+}
+
+/** 修改连接草稿：本机端口默认带动对外端口，已有 NAT 映射保留；仅隧道不问直连地址。 */
+async function panelConnection(node: NodeConfig): Promise<void> {
+  for (;;) {
+    const items = ["back", ...(node.direct ? ["address"] : []), "port", ...(node.direct ? ["nat"] : []), "listen"];
+    const labels: Record<string, string> = { back: "完成，返回节点摘要", address: "客户端连接地址", port: "本机监听端口", nat: "独立设置对外端口（NAT）", listen: "监听 IP / 网卡范围" };
+    const selected = items[await selectMenu("连接设置", `本机监听：${node.listen}:${node.port}\n${node.direct ? `客户端连接：${node.address || "未填写"}:${node.publicPort}` : "仅隧道接入，无需直连地址"}\n通常只改本机端口，对外端口自动跟随；已有独立映射不会被覆盖。`, items.map(item => labels[item]!))];
+    if (selected === "back") return;
+    if (selected === "address") node.address = await uiValidatedInput("客户端连接的公网 / 局域网 IP 或域名（可留空）", node.address, value => value ? normalizeClientAddress(value) : "", { clearable: true });
+    if (selected === "port") {
+      const previous = node.port;
+      node.port = await panelInteger("本地监听端口", previous);
+      if (node.publicPort === previous) node.publicPort = node.port;
+    }
+    if (selected === "nat") node.publicPort = await panelInteger("客户端连接端口（NAT 映射）", node.publicPort);
+    if (selected === "listen") node.listen = await uiValidatedInput("监听 IP（0.0.0.0 全部 IPv4；:: 全部 IPv6；仅隧道使用回环）", node.listen, value => {
+      const host = normalizeConnectAddress(value);
+      if (!panelNet.isIP(host)) throw new Error("监听范围必须是本机 IP，不能使用域名。");
+      if (!node.direct && !["127.0.0.1", "::1"].includes(host)) throw new Error("仅隧道节点须监听 127.0.0.1 或 ::1。");
+      return host;
+    });
+  }
+}
+
+/** 编辑传输和隧道草稿；保留凭据，切换接入方式时同步回环/对外监听。取消由上层丢弃本组副本。 */
+async function panelTransport(node: NodeConfig): Promise<void> {
+  const protocol = node.protocol, previousDirect = node.direct;
   if (["vless", "vmess", "trojan"].includes(protocol)) {
     const transports: NodeConfig["transport"]["type"][] = protocol === "vless" ? ["tcp", "ws", "grpc", "xhttp"] : ["tcp", "ws", "grpc"];
     node.transport.type = await panelEnum("传输方式", "Cloudflare HTTP 隧道只适用于 VLESS / VMess 的 WebSocket 传输。", transports, node.transport.type);
@@ -6770,7 +6845,7 @@ export async function configureNode(paths: AppPaths, existing?: NodeConfig): Pro
     node.tunnel.mode = await panelEnum("是否额外开启隧道", "关闭时按节点 IP / 域名和端口直连；隧道与节点协议是独立选项。", ["none", "quick", "fixed"] as const, node.tunnel.mode, ["关闭隧道", "临时隧道（自动分配域名）", "固定隧道（Token + 公共主机名）"]);
   } else node.tunnel.mode = "none";
   if (node.tunnel.mode !== "none") {
-    node.direct = (await selectMenu("节点接入方式", "仅隧道将监听本机回环地址；同时直连会开放所选监听地址。\n此组合的本机 WS 不附加 TLS，隧道客户端由 Cloudflare 提供 TLS。", ["仅通过隧道接入", "保留直连接入，同时开启隧道"], existing?.direct ? 1 : 0)) === 1;
+    node.direct = (await selectMenu("节点接入方式", "仅隧道将监听本机回环地址；同时直连会开放所选监听地址。\n此组合的本机 WS 不附加 TLS，隧道客户端由 Cloudflare 提供 TLS。\nVLESS 从 TLS / REALITY 切换并保留直连时，保存会自动准备 ENC，需重新导入客户端配置。", ["仅通过隧道接入", "保留直连接入，同时开启隧道"], previousDirect ? 1 : 0)) === 1;
     if (!node.direct) node.listen = node.listen.includes(":") ? "::1" : "127.0.0.1";
     if (node.tunnel.mode === "fixed") {
       node.tunnel.token = await uiValidatedInput("完整 Tunnel Token", node.tunnel.token, value => {
@@ -6781,41 +6856,33 @@ export async function configureNode(paths: AppPaths, existing?: NodeConfig): Pro
     node.tunnel.connectAddress = await uiValidatedInput("隧道客户端连接 IP / 域名（默认跟随隧道域名）", node.tunnel.connectAddress, normalizeConnectAddress, { clearable: true });
     node.tunnel.protocol = await panelEnum("隧道连接传输", "所在网络不允许 UDP 时可选择 HTTP2。", ["auto", "http2", "quic"] as const, node.tunnel.protocol, ["自动", "HTTP2", "QUIC"]);
   } else node.direct = true;
-  if (node.direct) {
-    console.log("监听 IP 控制本机哪些网卡接收连接，通常保持 0.0.0.0；它与下面供客户端使用的 VPS IP 是两项不同设置。");
-    node.listen = await promptInput("监听 IP（本机范围；0.0.0.0 为全部 IPv4，:: 为 IPv6）", existing?.direct === false ? existing.listen === "::1" ? "::" : "0.0.0.0" : node.listen);
-  }
-  const previousPort = node.port;
-  node.port = await panelInteger("本地监听端口", node.port);
-  if (node.publicPort === previousPort) node.publicPort = node.port;
-  if (node.direct) {
-    node.address = await uiValidatedInput("客户端连接的公网 / 局域网 IP 或域名（可留空，之后补填）", node.address, normalizeConnectAddress, { clearable: true });
-    node.publicPort = await panelInteger("客户端连接端口（NAT 映射时可与监听端口不同）", node.publicPort);
-  }
-  if (["vless", "vmess", "tuic"].includes(protocol)) {
-    node.uuid = await uiValidatedInput("节点 UUID（回车保留；输入 new 重新生成）", node.uuid, value => {
-      if (value === "new") return panelCrypto.randomUUID();
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) throw new Error("UUID 格式无效。"); return value.toLowerCase();
-    });
-  }
-  if (["socks", "naive"].includes(protocol)) node.username = await promptInput("认证用户名", node.username);
+
+  if (!previousDirect && node.direct) node.listen = node.listen === "::1" ? "::" : "0.0.0.0";
+  if (node.tunnel.mode !== "none") { node.tls.mode = "none"; node.flow = ""; }
+  else if (node.transport.type === "ws" && node.tls.mode === "reality") { node.tls.mode = "tls"; node.flow = ""; }
+}
+
+/** 只显示当前协议专属参数；node 为分组草稿，service 提供可替换的 ENC 生成器。 */
+async function panelProtocolOptions(paths: AppPaths, node: NodeConfig, service: PanelEditorServices): Promise<void> {
+  const protocol = node.protocol;
   if (protocol === "shadowsocks") {
     const method = await panelEnum("Shadowsocks 加密方法", "SS2022 需要对应长度的 Base64 密钥；更换算法后会生成匹配的新密码。", SHADOWSOCKS_METHODS, node.method as typeof SHADOWSOCKS_METHODS[number]);
     if (method !== node.method) node.password = generateShadowsocksPassword(method);
     node.method = method;
   }
-  if (["shadowsocks", "trojan", "hysteria2", "tuic", "anytls", "socks", "naive"].includes(protocol)) node.password = await panelPassword(node);
   if (protocol === "vmess") node.vmessSecurity = await panelEnum("VMess 客户端加密方式", "AEAD 节点，alterId 固定为 0。", ["auto", "aes-128-gcm", "chacha20-poly1305", "zero", "none"] as const, node.vmessSecurity);
-  await panelSecurity(paths, node);
   if (protocol === "vless") {
-    const encryption = await selectMenu("VLESS Encryption", "按客户端支持情况选择；ENC 会生成并保存配对的服务端解密参数和客户端加密参数。", ["不使用额外 VLESS ENC", "保留当前 ENC（如已设置）", "生成新的 ML-KEM-768 ENC 参数", "手动输入成对 ENC 参数"], node.vlessEncryption === "none" ? 0 : 1);
-    if (encryption === 0) { node.vlessEncryption = "none"; node.vlessDecryption = "none"; }
-    if (encryption === 2) {
+    const hasEncryption = node.vlessEncryption !== "none";
+    const encryptionItems = [...(hasEncryption ? ["keep"] : []), "none", "generate", "manual"];
+    const encryptionLabels: Record<string, string> = { keep: "保留当前 ENC", none: "不使用额外 VLESS ENC", generate: "生成新的 ML-KEM-768 ENC 参数", manual: "手动输入成对 ENC 参数" };
+    const encryption = encryptionItems[await selectMenu("VLESS Encryption", "按客户端支持情况选择；ENC 会生成并保存配对的服务端解密参数和客户端加密参数。", encryptionItems.map(item => encryptionLabels[item]!))];
+    if (encryption === "none") { node.vlessEncryption = "none"; node.vlessDecryption = "none"; }
+    if (encryption === "generate") {
       console.log("正在使用官方 Xray 生成 ENC 参数……");
-      const pair = await generateVlessEncryption(paths);
+      const pair = await service.encryption(paths);
       node.vlessEncryption = pair.vlessEncryption; node.vlessDecryption = pair.vlessDecryption;
     }
-    if (encryption === 3) {
+    if (encryption === "manual") {
       node.vlessDecryption = await promptInput("服务端 decryption", node.vlessDecryption, { secret: true });
       node.vlessEncryption = await promptInput("客户端 encryption", node.vlessEncryption, { secret: true });
     }
@@ -6832,16 +6899,86 @@ export async function configureNode(paths: AppPaths, existing?: NodeConfig): Pro
     node.tuic.congestionControl = await panelEnum("TUIC 拥塞控制", "服务端与导出客户端使用所选算法。", ["bbr", "cubic", "new_reno"] as const, node.tuic.congestionControl);
     node.tuic.zeroRttHandshake = (await selectMenu("TUIC 0-RTT", "默认关闭。", ["关闭", "开启"], node.tuic.zeroRttHandshake ? 1 : 0)) === 1;
   }
-  node.egress = await panelEnum("此节点的出口", "仅影响这个节点代理出去的流量，其他节点可使用不同出口。", ["direct", "warp"] as const, node.egress, ["本机 Direct", "WARP WireGuard"]);
-  if (node.egress === "warp" && !config.warp) config = await panelWarp(config);
-  node.enabled = (await selectMenu("保存后的节点状态", "保存不会自动中断当前后台；选择“启动 / 重启全部节点”后应用。", ["启用此节点", "保存为停用节点"], node.enabled ? 0 : 1)) === 0;
-  node = validateNode(node);
-  const nodes = config.nodes.some(item => item.id === node.id) ? config.nodes.map(item => item.id === node.id ? node : item) : [...config.nodes, node];
-  const candidate = validateConfig({ ...config, nodes }, { allowExpiredCertificate: true });
-  const decision = await selectMenu("保存节点", `${node.name}\n${panelEndpoint(node)}\n客户端地址：${node.address || "未填写（暂不导出直连链接）"}:${node.publicPort}\nTLS：${node.tls.mode}${node.tls.serverName ? ` / ${node.tls.serverName}` : ""}\n${node.tunnel.mode === "fixed" ? `Cloudflare 需将 ${node.tunnel.domain} 映射到 ${panelTunnelOrigin(node)}` : ""}`, ["保存", "取消"]);
-  if (decision !== 0) throw new UserCancelledError();
-  writeConfig(paths, candidate);
-  console.log("节点已保存。选择“启动 / 重启全部节点”应用配置。");
+}
+
+/**
+ * 按分组编辑节点草稿；paths 是隔离或正式路径，existing 是已有节点或未保存草稿。
+ * overrides 只替换证书/ENC 生成器。返回 Promise<void>；仅选择保存时写入磁盘。
+ * 每组使用副本，Esc 丢弃本组修改；保存前检查并发变更，保留其他节点。
+ */
+export async function configureNode(paths: AppPaths, existing?: NodeConfig, overrides: Partial<PanelEditorServices> = {}): Promise<void> {
+  const service = { certificate: generateSelfSignedCertificate, encryption: generateVlessEncryption, ...overrides };
+  const initial = readConfig(paths), original = existing ? initial.nodes.find(item => item.id === existing.id) : undefined;
+  let config = structuredClone(initial), notice = "", prepareEncryption = false;
+  const protocol = existing?.protocol ?? await panelEnum("选择节点协议 · 高级模式", "选好协议后只修改需要的分组；默认值已自动准备。", NODE_PROTOCOLS, "vless", NODE_PROTOCOLS.map(item => panelProtocolLabels[item]));
+  let node = existing ? structuredClone(existing) : createSimpleNode(protocol, config.nodes);
+  for (;;) {
+    const secure = !["shadowsocks", "socks"].includes(node.protocol) && node.tunnel.mode === "none";
+    const items = ["save", ...(secure ? ["security"] : []), ...(["vless", "vmess", "trojan"].includes(node.protocol) ? ["transport"] : []),
+      "address", "auth", ...(["vless", "vmess", "shadowsocks", "hysteria2", "tuic"].includes(node.protocol) ? ["options"] : []), "status", "protocol", "cancel"];
+    const labels: Record<string, string> = { save: "保存节点（稍后启动 / 重启应用）", security: ["vless", "anytls"].includes(node.protocol) ? "安全设置（TLS / REALITY / SNI）" : "安全设置（TLS / 证书 / SNI）", transport: "传输与隧道",
+      address: "连接地址与端口", auth: nodeAuthenticationLabel(node), options: "协议专属选项", status: "出口与启停", protocol: "更换节点协议", cancel: "取消，不保存" };
+    const summary: string = [node.name, panelEndpoint(node), node.direct ? `客户端连接：${node.address || "未填写（暂不导出直连链接）"}:${node.publicPort}` : "仅隧道接入，无需填写 VPS IP",
+      node.tls.mode === "reality" ? panelRealitySummary(node) : `安全层：${node.tls.mode}${node.tls.mode === "tls" ? `；证书名称：${node.tls.serverName}` : ""}`,
+      node.tunnel.mode === "fixed" ? `Cloudflare 映射：${node.tunnel.domain} → ${panelTunnelOrigin(node)}` : "",
+      prepareEncryption ? "直连加密：保存时自动准备 VLESS ENC，客户端需要重新导入。" : node.protocol === "vless" && node.tls.mode === "none" ? `直连加密：${node.vlessEncryption === "none" ? "无附加 TLS / ENC" : "VLESS ENC"}` : "",
+      "只编辑需要的分组。菜单内 Esc 撤销本组；文本输入时 Ctrl+C 退出面板。保存前不改变已有节点。", notice].filter(Boolean).join("\n");
+    const selected = items[await selectMenu("节点摘要 · 高级模式", summary, items.map(item => labels[item]!))]!;
+    if (selected === "cancel") throw new UserCancelledError();
+    try {
+      if (selected === "save") {
+        const ready = structuredClone(node);
+        if (prepareEncryption) {
+          console.log("正在为 VLESS 直连自动准备 ENC 加密参数……");
+          Object.assign(ready, await service.encryption(paths));
+        }
+        if (ready.enabled && ready.tls.mode === "tls" && (!ready.tls.certificatePem || !ready.tls.keyPem)) {
+          if (original?.protocol === ready.protocol || ready.tls.certificatePem || ready.tls.keyPem) throw new Error("已有节点的证书 / 私钥不完整，请在安全设置中导入或明确生成；不会自动覆盖已有材料。");
+          console.log("正在自动生成此节点的 TLS 证书……");
+          Object.assign(ready.tls, await service.certificate(paths, ready), { insecure: true });
+        }
+        const latest = readConfig(paths), current = latest.nodes.find(item => item.id === ready.id);
+        if (JSON.stringify(current) !== JSON.stringify(original)) throw new Error("这个节点已在另一处修改或删除，请取消后重新打开，避免覆盖新设置。");
+        const changedWarp = JSON.stringify(config.warp) !== JSON.stringify(initial.warp);
+        if (changedWarp && JSON.stringify(latest.warp) !== JSON.stringify(initial.warp)) throw new Error("共享 WARP 配置已在另一处修改，请取消后重新打开。");
+        const validated = validateNode(ready, { allowExpiredCertificate: true });
+        const nodes = current ? latest.nodes.map(item => item.id === ready.id ? validated : item) : [...latest.nodes, validated];
+        writeConfig(paths, validateConfig({ ...latest, ...(changedWarp ? { warp: config.warp } : {}), nodes }, { allowExpiredCertificate: true }));
+        console.log("节点已保存。选择“启动 / 重启全部节点”应用配置。");
+        return;
+      }
+      let draft = structuredClone(node);
+      let nextConfig = structuredClone(config);
+      if (selected === "security") await panelSecurity(paths, draft, service);
+      if (selected === "transport") await panelTransport(draft);
+      if (selected === "address") await panelConnection(draft);
+      if (selected === "auth") await editNodeAuthentication(draft);
+      if (selected === "options") await panelProtocolOptions(paths, draft, service);
+      if (selected === "status") {
+        draft.egress = await panelEnum("此节点的出口", "仅影响这个节点；其他节点可以使用不同出口。", ["direct", "warp"] as const, draft.egress, ["本机 Direct", "WARP WireGuard"]);
+        if (draft.egress === "warp" && !nextConfig.warp) nextConfig = await panelWarp(nextConfig);
+        draft.enabled = (await selectMenu("保存后的节点状态", "保存不重启后台；下次应用时生效。", ["启用此节点", "保存为停用节点"], draft.enabled ? 0 : 1)) === 0;
+      }
+      if (selected === "protocol") {
+        const changed = await panelEnum("更换节点协议", "选择相同协议保留参数；切换协议会重置协议参数与凭据，保存后需要重新导入客户端配置。", NODE_PROTOCOLS, draft.protocol, NODE_PROTOCOLS.map(item => panelProtocolLabels[item]));
+        if (changed !== draft.protocol) {
+          if (await selectMenu("确认更换协议", `${panelProtocolLabels[draft.protocol]} → ${panelProtocolLabels[changed]}，将生成新的协议凭据。原节点在保存前保持不变。`, ["返回，保留当前协议", "更换协议并重新配置"]) !== 1) continue;
+          draft = { ...createSimpleNode(changed, config.nodes.filter(item => item.id !== node.id)), id: node.id, name: node.name, enabled: node.enabled };
+        }
+      }
+      // 改传输/安全层后，Vision 仅在组合不再支持时关闭，不重置其他无关字段。
+      if (draft.flow && draft.vlessEncryption === "none" && (draft.transport.type !== "tcp" || draft.tls.mode === "none")) draft.flow = "";
+      // TLS / REALITY 改为 WS 隧道或由仅隧道恢复直连时，延后准备 ENC，避免降级为明文直连。
+      const lostProtection: boolean = selected === "transport" && (node.tls.mode !== "none" || !node.direct);
+      prepareEncryption = (prepareEncryption || lostProtection) && draft.protocol === "vless" && draft.direct && draft.tls.mode === "none" && draft.vlessEncryption === "none";
+      if (selected === "protocol" && draft.protocol !== node.protocol) prepareEncryption = false;
+      if (selected === "transport" && draft.protocol === "vmess" && draft.direct && draft.tunnel.mode !== "none" && ["none", "zero"].includes(draft.vmessSecurity) && (node.tls.mode !== "none" || !node.direct)) draft.vmessSecurity = "auto";
+      node = draft; config = nextConfig; notice = "草稿已更新；选择保存节点后写入。";
+    } catch (error) {
+      if (error instanceof UiExitRequestedError) throw error;
+      notice = error instanceof UserCancelledError ? "已撤销当前分组的修改，其余草稿保留。" : `操作未完成：${errorMessage(error)}`;
+    }
+  }
 }
 
 async function panelPickNode(config: AppConfig, title: string): Promise<NodeConfig | null> {
@@ -6864,7 +7001,7 @@ async function panelPickNode(config: AppConfig, title: string): Promise<NodeConf
 async function panelManageNodes(paths: AppPaths): Promise<void> {
   for (;;) {
     const config = readConfig(paths);
-    const choice = await selectMenu("节点管理", `已创建 ${config.nodes.length} / 32 个节点。默认使用简易模式，选协议后即可保存。`, ["新增节点（简易模式）", "编辑节点（简易模式）", "高级配置（逐项自定义）", "启用 / 停用节点", "复制节点", "删除节点", "返回"]);
+    const choice = await selectMenu("节点管理", `已创建 ${config.nodes.length} / 32 个节点。默认使用简易模式，选协议后即可保存。`, ["新增节点（简易模式）", "编辑节点（简易模式）", "高级配置（按需编辑）", "启用 / 停用节点", "复制节点", "删除节点", "返回"]);
     if (choice === 6) return;
     const simpleActions = { apply: (candidate: AppConfig) => panelApplyConfiguration(paths, candidate), advanced: (draft: NodeConfig) => configureNode(paths, draft) };
     try {

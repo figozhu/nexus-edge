@@ -1,4 +1,45 @@
-# NexusEdge 2.3.1 验证报告
+# NexusEdge 2.3.2 验证报告
+
+验证日期：2026-11-08。现场环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3；原生终端测试使用 ConPTY / pywinpty 3.1.2。
+
+| 本轮检查 | 结果 |
+| --- | --- |
+| Windows 全量单元 / 本机进程测试 | **490 通过、79 跳过、0 失败**；569 项、2758 断言 |
+| TypeScript、单文件构建、Git 空白检查 | **通过**，单文件版本为 **2.3.2** |
+| Windows 原生基础输入 | **4 / 4 通过**；中文、方向键、密文不回显、菜单 Esc、Ctrl+C 与终端恢复 |
+| Windows 简易节点流程 | **15 / 15 通过**；含认证分组回滚及进入高级编辑前的并发冲突检查 |
+| Windows 高级分组编辑 | **29 / 29 通过**；九协议创建及自定义参数、取消、并发保存 |
+| 生成单文件的高级分组编辑 | **同一组 29 / 29 通过**；直接导入发布文件，不运行主入口或跳转系统安装 |
+| 用户现有节点保护 | **通过**；系统安装和旧便携目录的配置 SHA-256 均与开始时完全相同 |
+| 测试清理 | **通过**；临时目录、测试节点及测试子进程均已清理，现有后台保持运行 |
+
+高级流程覆盖 REALITY 单次域名输入同步目标/SNI、无效输入重试、独立 IPv4/IPv6 目标与 SNI、握手端口、已有空 Short ID 与密钥保留、只改名称、按协议隐藏认证字段、必选 TLS 跳过单选菜单、端口自动跟随与独立 NAT 保留、VMess 三种隧道模式、VLESS 隧道直连的 ENC、VMess 加密恢复、Hysteria2/TUIC 参数、协议更换及取消、保留并发修改的无关节点和拒绝覆盖当前节点。
+
+所有交互夹具在独立临时目录创建节点，禁止网络请求、核心启动和端口监听；TLS/ENC 使用公开测试材料注入。以上结果验证实际终端按键、配置保存和客户端/服务端导出语义，不代表本轮重新执行了公网代理、Cloudflare 或 WARP 连通性验证。79 个跳过项涉及未启用的真实核心样本、系统集成及平台限定用例，不计为通过。
+
+菜单内 Esc 撤销当前分组，文本输入沿用 Ctrl+C 退出面板。没有保留会导致 Windows/Bun 连续输入失去响应的文本 Esc 实验代码。
+
+本机系统安装和旧便携目录的配置 SHA-256 均与测试前一致；本轮不升级系统副本、不重启现有服务。
+
+Windows 重跑（Python 需 UTF-8 模式；pywinpty 仅为测试依赖）：
+
+```powershell
+bun run build
+bun run typecheck
+bun test
+python -m pip install pywinpty==3.1.2
+python -X utf8 tests/ui-pty.py
+python -X utf8 tests/simple-pty.py
+python -X utf8 tests/panel-pty.py
+$env:NEXUS_EDGE_PTY_STANDALONE = '1'
+python -X utf8 tests/panel-pty.py
+```
+
+Linux 可使用同一组 Python 脚本的标准库 POSIX PTY。CI 同时覆盖两种操作系统及生成单文件的 29 个分组场景；推送后的结果以对应 GitHub Actions 运行为准。
+
+---
+
+# NexusEdge 2.3.1 验证报告（历史记录）
 
 验证日期：2026-11-08。当前开发与现场环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3；下方 2.3.0 报告属于历史记录，不计入本次结果。
 

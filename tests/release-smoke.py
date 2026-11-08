@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
     entry = script_dir / "nexus-edge.ts"
     shutil.copyfile(source, entry)
     version = subprocess.run([bun, str(entry), "--version"], cwd=work_dir, capture_output=True, text=True, check=True)
-    assert version.stdout.strip() == "2.3.1", version.stdout
+    assert version.stdout.strip() == "2.3.2", version.stdout
     help_result = subprocess.run([bun, str(entry), "--help"], cwd=work_dir, capture_output=True, text=True, check=True)
     assert "隧道按节点可选" in help_result.stdout and "Shadowsocks" not in help_result.stderr
     assert not (script_dir / ".nexus-edge").exists(), "Help/version should not initialize configuration"

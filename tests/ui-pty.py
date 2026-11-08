@@ -5,9 +5,10 @@ Usage:
   python3 tests/ui-pty.py --bun /absolute/path/to/bun
   NEXUS_EDGE_BUN=/absolute/path/to/bun python3 tests/ui-pty.py
 
-Uses only Python's standard library. Linux/macOS test harness; the application
-itself still targets Windows/Linux. No download, account registration, proxy
-listener, daemon, system service, or production configuration is created.
+Linux/macOS uses Python's standard library; Windows uses native ConPTY through
+the optional pywinpty test dependency (python -m pip install pywinpty).
+No download, account registration, proxy listener, daemon, system service, or
+production configuration is created by the fixtures.
 """
 
 from __future__ import annotations
@@ -28,12 +29,12 @@ import sys
 import tempfile
 import time
 
-if os.name != "posix":
-    raise SystemExit("This regression harness requires a POSIX PTY. Run it on Linux with Bun.")
-
-import fcntl
-import pty
-import termios
+if os.name == "nt":
+    from windows_pty import WindowsPtyProcess
+else:
+    import fcntl
+    import pty
+    import termios
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,37 +47,53 @@ class Terminal:
     def __init__(self, bun: str, scenario: str, fixture: Path = FIXTURE):
         self.scenario = scenario
         self.scratch = tempfile.TemporaryDirectory(prefix="nexus-ui-pty-")
-        self.master, self.slave = pty.openpty()
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        self.original_attributes = termios.tcgetattr(self.slave)
         self.output = bytearray()
         self.position = 0
+        self._secret_next_write = False
+        self._secrets: list[tuple[int, bytes]] = []
         env = dict(os.environ, TERM="xterm-256color", LANG="C.UTF-8", NO_COLOR="1")
-        self.process = subprocess.Popen(
-            [bun, str(fixture), scenario],
-            stdin=self.slave,
-            stdout=self.slave,
-            stderr=self.slave,
-            cwd=self.scratch.name,
-            env=env,
-            start_new_session=True,
-            close_fds=True,
-        )
+        if os.name == "nt":
+            try:
+                self.process = WindowsPtyProcess([bun, str(fixture), scenario], self.scratch.name, env)
+            except Exception:
+                self.scratch.cleanup()
+                raise
+        else:
+            self.master, self.slave = pty.openpty()
+            fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+            self.original_attributes = termios.tcgetattr(self.slave)
+            self.process = subprocess.Popen(
+                [bun, str(fixture), scenario],
+                stdin=self.slave,
+                stdout=self.slave,
+                stderr=self.slave,
+                cwd=self.scratch.name,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
 
     def diagnostic(self) -> str:
         clean = ANSI.sub(b"", bytes(self.output[-6000:]))
         return clean.decode("utf-8", errors="replace")
 
     def read(self, wait: float = 0.1) -> bool:
-        if not select.select([self.master], [], [], wait)[0]:
-            return False
-        try:
-            data = os.read(self.master, 65536)
-        except OSError as error:
-            if error.errno == errno.EIO:
+        if os.name == "nt":
+            data = self.process.read(wait)
+        else:
+            if not select.select([self.master], [], [], wait)[0]:
                 return False
-            raise
+            try:
+                data = os.read(self.master, 65536)
+            except OSError as error:
+                if error.errno == errno.EIO:
+                    return False
+                raise
         self.output.extend(data)
+        # ConPTY 无 POSIX termios；检查真实捕获输出，防止完整或被 ANSI 分隔的密文回显。
+        for start, secret in self._secrets:
+            if secret in ANSI.sub(b"", bytes(self.output[start:])):
+                raise AssertionError(f"{self.scenario}: secret input was echoed")
         return bool(data)
 
     def expect(self, value: str | bytes, timeout: float = 5.0) -> None:
@@ -117,10 +134,22 @@ class Terminal:
 
     def send(self, value: str | bytes) -> None:
         data = value.encode("utf-8") if isinstance(value, str) else value
+        if self._secret_next_write:
+            secret = data.rstrip(b"\r\n")
+            if secret:
+                self._secrets.append((len(self.output), secret))
+            self._secret_next_write = False
+        if os.name == "nt":
+            self.process.write(data)
+            return
         while data:
             data = data[os.write(self.master, data):]
 
     def assert_no_echo(self) -> None:
+        if os.name == "nt":
+            # 下一次输入由 read() 持续检查；fixture 另行报告 raw=false 并继续可见输入。
+            self._secret_next_write = True
+            return
         attributes = termios.tcgetattr(self.slave)
         if attributes[3] & termios.ECHO:
             raise AssertionError(f"{self.scenario}: the terminal would echo secret input")
@@ -128,13 +157,14 @@ class Terminal:
     def finish(self, allow_files: bool = False) -> None:
         self.event("done")
         self.process.wait(timeout=5)
-        while self.read(0):
+        while self.read(0.05 if os.name == "nt" else 0):
             pass
         if self.process.returncode:
             raise AssertionError(f"{self.scenario}: fixture exited {self.process.returncode}\n{self.diagnostic()}")
-        attributes = termios.tcgetattr(self.slave)
-        if attributes != self.original_attributes:
-            raise AssertionError(f"{self.scenario}: terminal attributes were not restored")
+        if os.name != "nt":
+            attributes = termios.tcgetattr(self.slave)
+            if attributes != self.original_attributes:
+                raise AssertionError(f"{self.scenario}: terminal attributes were not restored")
         output = bytes(self.output)
         if b"\x1b[?25l" in output and output.rfind(b"\x1b[?25h") < output.rfind(b"\x1b[?25l"):
             raise AssertionError(f"{self.scenario}: cursor was left hidden")
@@ -142,6 +172,12 @@ class Terminal:
             raise AssertionError(f"{self.scenario}: primitive UI fixture unexpectedly wrote files")
 
     def close(self) -> None:
+        if os.name == "nt":
+            try:
+                self.process.close()
+            finally:
+                self.scratch.cleanup()
+            return
         if self.process.poll() is None:
             os.killpg(self.process.pid, signal.SIGTERM)
             try:

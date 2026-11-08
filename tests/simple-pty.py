@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -93,6 +94,7 @@ def run_existing_complex(t):
     assert all(value == 0 for value in saved["calls"].values()), saved
     assert PROTOCOLS.encode() not in t.output, "Existing nodes should open at their summary"
     no_detailed_prompts(t)
+    assert b"handshake.example.test:8443" in t.output and b"SNI target.example.test" in t.output
 
 
 def run_default_trojan(t):
@@ -275,6 +277,36 @@ def run_export_missing_ss(t):
     no_detailed_prompts(t)
 
 
+def run_auth_cancel(t):
+    """编辑名称后撤销认证分组，再保存；原节点字段和配置字节都应不变。"""
+    seed = t.event("seed")
+    choose(t, SUMMARY, 5)
+    choose(t, "名称与认证", 1)
+    enter(t, "节点名称（", "稍后撤销的名称")
+    t.expect("名称与认证")
+    t.send(b"\x1b")
+    choose(t, SUMMARY, 2)
+    saved = t.event("saved")
+    assert saved["nodes"] == seed["nodes"] and saved["configHash"] == seed["configHash"]
+
+
+def run_advanced_conflict(t):
+    """模拟另一面板更新临时节点，验证进入高级模式前拒绝把旧草稿交接过去。"""
+    seed = t.event("seed")
+    t.expect(SUMMARY)
+    filename = Path(t.scratch.name) / ".nexus-edge" / "config.json"
+    config = json.loads(filename.read_text(encoding="utf-8"))
+    config["nodes"][0]["name"] = "另一面板保存的新名称"
+    filename.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    t.send("6")
+    t.expect("这个节点已在另一处修改")
+    choose(t, SUMMARY, 7)
+    saved = t.event("cancelled")
+    assert saved["nodes"][0]["name"] == "另一面板保存的新名称"
+    assert saved["nodes"][0]["uuid"] == seed["nodes"][0]["uuid"]
+    assert saved["calls"]["advanced"] == 0
+
+
 CASES = {
     "default-ss": lambda t: run_default(t, "shadowsocks", 3, 8395, True),
     "default-vmess": lambda t: run_default(t, "vmess", 2, 10093, False),
@@ -289,6 +321,8 @@ CASES = {
     "vmess-tls-to-tunnel": run_vmess_tls_to_tunnel,
     "cancel": run_cancel,
     "export-missing-ss": run_export_missing_ss,
+    "auth-cancel": run_auth_cancel,
+    "advanced-conflict": run_advanced_conflict,
 }
 
 

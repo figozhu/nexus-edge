@@ -6,7 +6,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.1";
+export const APP_VERSION = "2.3.2";
 
 export interface WarpProfile {
   privateKey: string;

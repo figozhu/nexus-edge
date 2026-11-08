@@ -13,6 +13,6 @@ const parts = files.map(file => {
   if (/from\s*["']\.\//.test(stripped)) throw new Error(`Unexpected multiline relative import in ${file}`);
   return `\n// ==================== ${file} ====================\n${stripped}`;
 });
-const header = `#!/usr/bin/env bun\n/**\n * NexusEdge 2.3.1 — IPv4-first cores, IPv6 controls and reliable Windows startup.\n * Run: bun nexus-edge.ts\n * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.\n * Generated from the typed source modules using scripts/build.ts.\n * No npm runtime dependencies. See README.md for operation and verification.\n */\n`;
+const header = `#!/usr/bin/env bun\n/**\n * NexusEdge 2.3.2 — 按需编辑节点、REALITY 单次域名输入与跨平台终端交互。\n * Run: bun nexus-edge.ts\n * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.\n * Generated from the typed source modules using scripts/build.ts.\n * No npm runtime dependencies. See README.md for operation and verification.\n */\n`;
 writeFileSync(join(root, "nexus-edge.ts"), header + parts.join("\n"));
 console.log(`Built ${join(root, "nexus-edge.ts")}`);

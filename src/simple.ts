@@ -204,7 +204,13 @@ export async function repairNodeAddress(paths: AppPaths, nodeId: string, overrid
   return current;
 }
 
-async function simpleAuthentication(node: NodeConfig): Promise<void> {
+/** 根据协议返回认证分组标题；只列出实际使用的凭据，避免无关 UUID 提示。 */
+export function nodeAuthenticationLabel(node: NodeConfig): string {
+  return `名称与${["vless", "vmess"].includes(node.protocol) ? " UUID" : node.protocol === "tuic" ? " UUID / 密码" : ["socks", "naive"].includes(node.protocol) ? "用户名 / 密码" : "密码"}`;
+}
+
+/** 编辑传入草稿的名称与认证；只处理用户选择的字段，返回 Promise<void>，不写入配置。 */
+export async function editNodeAuthentication(node: NodeConfig): Promise<void> {
   const hasUuid = ["vless", "vmess", "tuic"].includes(node.protocol);
   const hasUser = ["socks", "naive"].includes(node.protocol);
   const hasPassword = !["vless", "vmess"].includes(node.protocol);
@@ -265,7 +271,8 @@ async function simpleTunnel(node: NodeConfig): Promise<{ node: NodeConfig; prepa
 }
 
 function simpleSummary(paths: AppPaths, config: AppConfig, node: NodeConfig, existing: boolean, notice: string, prepareEncryption: boolean): string {
-  const security = node.tls.mode === "reality" ? `REALITY（目标 ${node.tls.serverName}，密钥已准备）`
+  const realityHost = node.tls.reality.handshakeServer;
+  const security = node.tls.mode === "reality" ? `REALITY（握手目标 ${realityHost.includes(":") ? `[${realityHost}]` : realityHost}:${node.tls.reality.handshakePort}；SNI ${node.tls.serverName}${realityHost === node.tls.serverName ? "，同目标域名" : "，独立设置"}）`
     : node.tls.mode === "tls" ? node.tls.certificatePem ? `TLS（已有证书，名称 ${node.tls.serverName}）` : "TLS（保存时自动生成独立证书，无需自备域名）"
     : node.protocol === "vless" ? prepareEncryption ? "ENC（保存时自动生成加密参数）" : node.vlessEncryption !== "none" ? "VLESS ENC" : "无附加 TLS / ENC"
     : node.protocol === "socks" ? "SOCKS5 用户名 / 密码认证" : node.protocol === "vmess" && ["none", "zero"].includes(node.vmessSecurity) ? "VMess 未开启协议加密 / TLS（已有高级配置）" : "协议自身加密";
@@ -303,7 +310,7 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
   }
   for (;;) {
     const items = ["apply", "save", ...(["vless", "vmess"].includes(node.protocol) ? ["tunnel"] : []), "address", "auth", "advanced", "cancel"];
-    const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: "名称与 UUID / 密码", advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
+    const labels: Record<string, string> = { apply: "保存并应用（准备核心 / 启动节点）", save: "仅保存，稍后启动", tunnel: "隧道设置（关闭 / 临时 / 固定）", address: "连接地址与端口", auth: nodeAuthenticationLabel(node), advanced: "高级配置（传输 / SNI / 证书 / 更多参数）", cancel: "取消，不保存" };
     const selected = items[await selectMenu("节点摘要 · 简易模式", simpleSummary(paths, config, node, Boolean(original), notice, prepareEncryption), items.map(item => labels[item]!))]!;
     if (selected === "cancel") throw new UserCancelledError();
     try {
@@ -311,9 +318,15 @@ export async function configureSimpleNode(paths: AppPaths, existing: NodeConfig 
         const changed = await simpleTunnel(node); node = changed.node; notice = changed.notice;
         prepareEncryption = (prepareEncryption || changed.prepareEncryption) && node.tunnel.mode !== "none" && node.direct && node.vlessEncryption === "none";
       } else if (selected === "address") node = await editConnectionAddress(node, service, newDraft);
-      else if (selected === "auth") await simpleAuthentication(node);
+      else if (selected === "auth") {
+        // 分组使用副本，Esc 返回时不把只完成一半的名称/凭据带回摘要。
+        const draft = structuredClone(node); await editNodeAuthentication(draft); node = draft;
+      }
       else if (selected === "advanced") {
         if (prepareEncryption) { console.log("先准备已选择的 VLESS ENC 加密参数……"); Object.assign(node, await service.encryption(paths)); prepareEncryption = false; }
+        // 交接前核对最初读取的节点，防止高级编辑把较新的磁盘版本误当作旧草稿的保存基线。
+        const current = readConfig(paths).nodes.find(item => item.id === node.id);
+        if (JSON.stringify(current) !== JSON.stringify(original)) throw new Error("这个节点已在另一处修改，请退出后重新打开，避免覆盖新设置。");
         await actions.advanced(structuredClone(node)); return;
       }
       else if (selected === "save" || selected === "apply") {

@@ -3,7 +3,7 @@ import * as simpleFixturePath from "node:path";
 import * as simpleFixtureFs from "node:fs";
 import * as simpleFixtureCrypto from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { type NodeConfig, createPaths, createDefaultNode, defaultConfig, readConfig, writeConfig, generateRealityKeyPair } from "../../src/core.ts";
+import { type NodeConfig, createPaths, createDefaultNode, defaultConfig, readConfig, writeConfig, generateRealityKeyPair, ensureDataDir } from "../../src/core.ts";
 import { configureSimpleNode, type SimplePanelServices, type SimplePanelActions } from "../../src/simple.ts";
 import { createSimpleNode } from "../../src/presets.ts";
 import { panelExport } from "../../src/panel.ts";
@@ -20,6 +20,8 @@ const testEncryption = {
 
 const scenario = process.argv[2] ?? "";
 const paths = createPaths(simpleFixturePath.join(process.cwd(), "nexus-edge.ts"));
+// Windows 首次建立隔离数据目录需执行 ACL 设置；在禁用后续进程/网络前完成。
+ensureDataDir(paths);
 const calls = { detect: 0, local: 0, port: 0, certificate: 0, encryption: 0, apply: 0, advanced: 0, forbiddenIO: 0 };
 const portChecks: { protocol: string; listen: string; port: number }[] = [];
 const denyIO = () => { calls.forbiddenIO++; throw new Error("Simple PTY fixtures must not access a network, start a process, or listen on a socket."); };
@@ -126,7 +128,7 @@ switch (scenario) {
       password: "DORMANT_PASSWORD_8759", address: "complex.example.test", listen: "127.0.0.1", port: 29311, publicPort: 49311 });
     node.transport = { type: "xhttp", path: "/keep-xhttp-path", host: "front.example.test:8443", serviceName: "dormant-grpc", mode: "packet-up" };
     node.tls = { mode: "reality", serverName: "target.example.test", alpn: ["h2"], certificatePem, keyPem, insecure: false,
-      reality: { ...generateRealityKeyPair(), shortId: "abcdef0123", handshakeServer: "target.example.test", handshakePort: 8443 } };
+      reality: { ...generateRealityKeyPair(), shortId: "abcdef0123", handshakeServer: "handshake.example.test", handshakePort: 8443 } };
     node.hy2 = { obfsPassword: "DORMANT_OBFS_642", upMbps: 99, downMbps: 321 };
     node.tuic = { congestionControl: "cubic", zeroRttHandshake: true };
     node.tunnel = { mode: "none", token: "DORMANT_TOKEN_0123456789", domain: "saved.example.test", connectAddress: "edge.example.test", protocol: "http2" };
@@ -152,6 +154,13 @@ switch (scenario) {
     await cancelledEditor(true, "cancelled-1");
     await cancelledEditor(false, "cancelled-2");
     break;
+  case "auth-cancel":
+    seed(existingVmess()); await editor(); snapshot("saved"); break;
+  case "advanced-conflict":
+    seed(existingVmess());
+    // Python 驱动在摘要停留时修改自己的临时配置，模拟另一面板保存。
+    try { await editor(); } catch (error) { if (!(error instanceof UserCancelledError)) throw error; }
+    snapshot("cancelled"); break;
   case "export-missing-ss": {
     const node = createDefaultNode("shadowsocks");
     Object.assign(node, { name: "旧 SS 缺地址", uuid: "77777777-1111-4222-8333-444444444444", username: "preserved-user",

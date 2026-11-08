@@ -32,6 +32,22 @@ jobs:
         run: bun run typecheck
       - name: 运行单元和本机进程测试
         run: bun test
+      # 原生 ConPTY 覆盖 Windows 中文输入、密文隐藏、返回操作及所有协议的节点编辑。
+      - name: 验证 Windows 原生交互菜单
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pywinpty==3.1.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/ui-pty.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/panel-pty.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/simple-pty.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:NEXUS_EDGE_PTY_STANDALONE = '1'
+          python -X utf8 tests/panel-pty.py
+          exit $LASTEXITCODE
       # 脚本自行创建独立 net/mount namespace，并核对宿主 sysctl 与配置未变。
       # 只对隔离回环接口操作；持久化目录为私有 tmpfs，不修改 runner 的网卡。
       - name: 验证 Linux IPv6 真实内核开关与持久化配置
@@ -46,4 +62,5 @@ jobs:
           python3 tests/ui-pty.py --bun "$(command -v bun)"
           python3 tests/panel-pty.py --bun "$(command -v bun)"
           python3 tests/simple-pty.py --bun "$(command -v bun)"
+          NEXUS_EDGE_PTY_STANDALONE=1 python3 tests/panel-pty.py --bun "$(command -v bun)"
           python3 tests/release-smoke.py --bun "$(command -v bun)"
