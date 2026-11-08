@@ -39,7 +39,8 @@ else:
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "tests" / "fixtures" / "ui-entry.ts"
-EVENT = re.compile(rb"__NEXUS_PTY__(\{[^\r\n]*\})")
+# 必须等行结束再解析：POSIX PTY 可能把大快照拆在嵌套对象的 } 后，不能把半条 JSON 当成事件。
+EVENT = re.compile(rb"__NEXUS_PTY__(\{[^\r\n]*\})(?=[\r\n])")
 ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07)")
 
 
@@ -104,7 +105,8 @@ class Terminal:
             if at >= 0:
                 self.position = at + len(expected)
                 return
-            if time.monotonic() >= deadline or self.process.poll() is not None:
+            # ConPTY 在子进程退出后仍会异步送出末尾输出，不能仅凭退出码提前判定缺少事件。
+            if time.monotonic() >= deadline or (os.name != "nt" and self.process.poll() is not None):
                 self.read(0)
                 at = self.output.find(expected, self.position)
                 if at >= 0:
@@ -125,7 +127,8 @@ class Terminal:
                 if value.get("raw"):
                     raise AssertionError(f"{self.scenario}: raw mode remained active after {name}")
                 return value
-            if time.monotonic() >= deadline or self.process.poll() is not None:
+            # Windows 保留原有有界超时等待，让 ConPTY 排空退出前已经写出的快照。
+            if time.monotonic() >= deadline or (os.name != "nt" and self.process.poll() is not None):
                 self.read(0)
                 if EVENT.search(self.output, self.position):
                     continue
