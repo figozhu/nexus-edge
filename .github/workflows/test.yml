@@ -33,6 +33,15 @@ jobs:
         run: bun run typecheck
       - name: 运行单元和本机进程测试
         run: bun test
+      # 验证截图生成前移除完整目录，包括中文、空格和跨行路径。
+      - name: 验证截图隐私遮盖
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pyte==0.8.2 Pillow
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/snapshot-privacy.py
+          exit $LASTEXITCODE
       # 原生 ConPTY 覆盖 Windows 中文输入、密文隐藏、返回操作及所有协议的节点编辑。
       - name: 验证 Windows 原生交互菜单
         if: runner.os == 'Windows'

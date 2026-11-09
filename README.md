@@ -6,7 +6,7 @@ NexusEdge 将 Xray、sing-box 和 Cloudflare Tunnel 的配置与管理集中到�
 
 [下载最新版](https://github.com/figozhu/nexus-edge/releases/latest) · [反馈问题](https://github.com/figozhu/nexus-edge/issues)
 
-![NexusEdge 主菜单](snapshot/main-menu.png)
+![NexusEdge 主菜单（本机路径已打码）](snapshot/main-menu.png)
 
 <details>
 <summary>查看协议选择与网络设置</summary>
@@ -222,7 +222,7 @@ WARP 只作用于选择它的节点，不创建全系统 TUN。启用前需准�
 - `node-link.txt`：当前就绪节点的链接。
 - `exports/`：导出的客户端 JSON。
 
-配置、备份和导出文件都可能含密码、Token 或私钥。提交问题时请遮盖敏感信息，并附上操作系统、NexusEdge 版本、复现步骤和相关错误信息。
+配置、备份和导出文件都可能含密码、Token 或私钥。公开截图、日志或提交问题时，还应遮盖本机完整路径（包括临时目录）、用户名、主机名和真实服务器地址；路径可只保留 `.nexus-edge/config.json` 这类通用部分。请附上操作系统、NexusEdge 版本、复现步骤和已脱敏的相关错误信息。
 
 ## 许可证
 
