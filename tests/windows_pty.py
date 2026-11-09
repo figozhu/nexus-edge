@@ -77,5 +77,12 @@ class WindowsPtyProcess:
                 os.kill(self.pid, signal.SIGTERM)
                 self.wait(timeout=2)
         finally:
-            self.pty.cancel_io()
-            self.pty = None
+            # 已退出的 ConPTY 可能没有待取消的 I/O；Windows 返回的此特定状态不代表进程未清理。
+            exited = self.poll() is not None
+            try:
+                self.pty.cancel_io()
+            except Exception as error:
+                if not exited or str(error).strip() != "Element not found.":
+                    raise
+            finally:
+                self.pty = None

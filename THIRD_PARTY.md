@@ -1,7 +1,13 @@
 # Third-party components and references
 
-NexusEdge 2.3.0 launches upstream cores as separate processes. This source
-archive contains no Bun, Xray, sing-box, cloudflared, or libcronet binaries.
+NexusEdge launches upstream cores as separate processes. The source archive
+contains no Bun, Xray, sing-box, cloudflared, or libcronet binaries.
+Standalone Release executables embed Bun 1.4.4; users do not install a separate
+runtime. See `BUN-LICENSE.md`, copied from Bun's `bun-v1.4.4` tag, for its MIT
+license and linked-library notices, including JavaScriptCore/WebKit. The complete
+NexusEdge TypeScript source and build instructions accompany every Release.
+To replace the embedded runtime, rebuild from these sources with your compatible
+Bun build; Bun's notice links its WebKit source and relinking instructions.
 First-use defaults have pinned official URLs, archive hashes, and extracted file
 hashes in `src/network.ts`. Explicit updates query the same official repositories
 through GitHub Releases, require the release asset's SHA256 digest, and record
@@ -10,7 +16,7 @@ independently of future controller updates. Upstream licenses and notices remain
 
 | Component | Role | Upstream |
 | --- | --- | --- |
-| Bun >= 1.4.3 | TypeScript runtime; system install copies the user's runtime | <https://github.com/oven-sh/bun> |
+| Bun 1.4.4 (compiled) / >= 1.4.3 (script) | Embedded in standalone executables; script installs copy the user's runtime | <https://github.com/oven-sh/bun> |
 | Xray 26.3.27 | VLESS, transports, REALITY / ENC, WireGuard egress | <https://github.com/XTLS/Xray-core/releases/tag/v26.3.27> |
 | sing-box 1.14.3 | Other node protocols, WireGuard endpoint | <https://github.com/SagerNet/sing-box/releases/tag/v1.14.3> |
 | cloudflared 2026.10.2 | Optional per-node HTTP Tunnel connector | <https://github.com/cloudflare/cloudflared/releases/tag/2026.10.2> |

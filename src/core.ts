@@ -6,7 +6,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.3";
+export const APP_VERSION = "3.0.0";
 
 export interface WarpProfile {
   privateKey: string;
@@ -153,6 +153,26 @@ export function assertSupportedPlatform(os = process.platform, cpu = process.arc
   if (cpu !== "x64" && !(os === "linux" && cpu === "arm64")) {
     throw new Error(`暂不支持 ${os}/${cpu}。Windows 请使用 x64 Bun；Windows ARM64 没有对应的官方 cloudflared 资产。`);
   }
+}
+
+/**
+ * 判断入口是否为包含 Bun 的独立程序。
+ * @param paths 入口及运行时的绝对路径；独立程序二者相同，脚本版二者不同。
+ * @returns 是否无需在启动参数中再次传入脚本；Windows 路径忽略大小写。
+ */
+export function isCompiledEntry(paths: Pick<AppPaths, "entry" | "runtime">): boolean {
+  const normalize = (value: string): string => process.platform === "win32" ? corePath.resolve(value).toLowerCase() : corePath.resolve(value);
+  return normalize(paths.entry) === normalize(paths.runtime);
+}
+
+/**
+ * 为后台、提权和系统服务生成统一参数，避免独立程序把自身路径误认成命令。
+ * @param paths 当前安装的入口和运行时；允许面板管理不同形式的系统副本。
+ * @param args 应用参数，不包含可执行文件名。
+ * @returns 新数组：脚本模式前置入口，独立程序模式仅保留应用参数。
+ */
+export function appArguments(paths: Pick<AppPaths, "entry" | "runtime">, args: string[]): string[] {
+  return isCompiledEntry(paths) ? [...args] : [paths.entry, ...args];
 }
 
 export function createPaths(entry: string, runtime = process.execPath): AppPaths {

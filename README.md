@@ -1,12 +1,29 @@
-# NexusEdge 2.3.3
+# NexusEdge 3.0.0
 
-**Windows / Linux 多协议节点管理脚本，Bun + TypeScript，单文件发布。**
+**Windows / Linux 多协议节点管理工具，提供无需安装 Bun 的独立可执行文件，也保留 TypeScript 单文件。**
+
+**3.0.0 提供免安装 Bun 的三平台可执行文件及自动 Release。** 下载后直接运行；后台、自启、升级和卸载均支持独立程序。主分支推送会自动测试、构建，并为尚未发布的新版本创建 Release。
+
+### 界面预览
+
+以下图片来自 3.0.0 独立程序的真实 ConPTY 终端帧，使用全新空配置捕获后渲染为 PNG。没有真实节点、服务器地址、UUID、密码、Token 或私钥。可复现方法见 [snapshot 说明](snapshot/README.md)。
+
+![NexusEdge 主菜单](snapshot/main-menu.png)
+
+<details>
+<summary>查看协议选择与网络设置</summary>
+
+![支持的协议与简易预设](snapshot/protocols.png)
+
+![IPv6 与防火墙设置入口](snapshot/network-settings.png)
+
+</details>
 
 支持多协议节点方向重做配置模型：可以同时创建多个 VLESS、VMess、Shadowsocks 等节点；各节点独立选择协议、端口、凭据、TLS / REALITY 和 Direct / WARP 出口。**隧道默认关闭**。支持隧道的节点可额外选择临时或固定隧道，也可同时保留直连接入。
 
 **默认简易模式：选协议 → 查看摘要 → 保存并应用。** 程序自动准备 IP、可用端口、UUID / 密码以及必要的安全参数，并放行本机防火墙所需的节点端口。创建普通节点无需注册 Cloudflare、提供 Tunnel Token 或自备域名。已有节点打开编辑后直接显示摘要，保留自己的高级配置。
 
-发布入口 `nexus-edge.ts` 包含完整 TypeScript 代码，运行时无需 npm 包。完整包另有模块化源码、构建工具和测试。脚本使用 Bun 的服务与 SQLite API，**请用 Bun 运行，不支持直接用 Node.js 执行**。
+Release 可执行文件内置 Bun，用户无需安装 Bun、Node.js 或 npm 依赖。源码入口 `nexus-edge.ts` 包含完整 TypeScript 代码；脚本形式仍须 Bun 运行，不支持直接用 Node.js 执行。协议核心仍按实际节点需求单独下载并校验。
 
 **2.2 新增内核管理：检查官方更新、按需升级、指定版本、回退。2.2.1 将首次使用默认值统一为当前官方最新稳定版。** 预发布版仅通过高级选项主动选择；后续更新无需手工修改 TypeScript 中的版本号和哈希。详见第 8 节。
 
@@ -20,7 +37,17 @@
 
 ## 1. 快速开始
 
-安装 [Bun](https://bun.sh/docs/installation)，新开终端确认 `bun --version` 不低于 **1.4.3**。将单文件或完整代码包放入可写目录，保持入口文件名为 `nexus-edge.ts`。
+从[最新 Release](https://github.com/figozhu/nexus-edge/releases/latest) 下载对应平台文件，放入自己的可写目录。使用同一 Release 的 `SHA256SUMS` 核对下载摘要；Windows 可用 `Get-FileHash -Algorithm SHA256`，Linux 可用 `sha256sum`。
+
+| 平台 | 下载文件 | 运行 |
+| --- | --- | --- |
+| Windows x64 | `nexus-edge-windows-x64.exe` | `.\nexus-edge-windows-x64.exe` |
+| Linux x64（glibc） | `nexus-edge-linux-x64` | `chmod +x nexus-edge-linux-x64 && ./nexus-edge-linux-x64` |
+| Linux arm64（glibc） | `nexus-edge-linux-arm64` | `chmod +x nexus-edge-linux-arm64 && ./nexus-edge-linux-arm64` |
+
+可重命名为 `nexus-edge.exe` / `nexus-edge`；配置始终保存在**可执行文件所在目录**的 `.nexus-edge`，与终端工作目录无关。正常运行会识别已有系统安装；加 `--local` 可明确打开当前便携目录。首次运行使用正常终端窗口，管理面板不接受管道输入。
+
+如果选择源码形式，安装 [Bun](https://bun.com/docs/installation)，确认 `bun --version` 不低于 **1.4.3**，保持入口文件名为 `nexus-edge.ts`。下面的 Bun 命令仅适用于源码形式；独立程序直接运行下载文件，并使用相同的应用参数。
 
 Windows PowerShell / cmd：
 
@@ -336,6 +363,12 @@ Windows 依赖系统 PowerShell、任务计划程序、`icacls.exe`；Linux 系�
 
 ## 9. 自动启动与升级
 
+独立程序的自启、提权、后台进程和卸载都直接运行程序本身，系统安装不会再复制外部 Bun。Windows 固定系统入口为 `NexusEdge\nexus-edge.exe`，Linux 为 `/opt/nexus-edge/nexus-edge`；旧脚本安装布局继续兼容。
+
+同格式升级可从新下载的便携程序发起。**Windows 独立程序升级前必须停止后台并关闭所有系统副本面板**，再运行新下载的 EXE；文件仍被占用时会保留原程序并报错。便携更新同样须先退出旧程序，再替换同目录文件，保留 `.nexus-edge`。
+
+脚本版与独立程序版不直接覆盖彼此的系统安装。切换时先备份 `config.json`，使用旧版卸载并选择**保留配置**，将保留的配置复制到新版便携目录的 `.nexus-edge/config.json`，用 `--local` 打开并验证节点后重新启用系统自启。不要复制旧 `runtime.json` 或锁文件。已有版本选择如需保留，按第 10 节备份同平台内核目录及版本记录；旧版保留配置卸载会清理核心缓存。
+
 普通后台脱离终端运行；长期运行可启用自启。关机、休眠或网络中断期间无法提供服务。
 
 Windows 系统模式安装到系统 CommonApplicationData 下的 `NexusEdge`（通常 `C:\ProgramData\NexusEdge`），使用 SYSTEM 开机任务，无需登录。程序目录受管理员 / SYSTEM 保护，私有数据不向普通用户开放。可选用户模式只在当前用户登录后运行。
@@ -454,6 +487,9 @@ bun nexus-edge.ts --uninstall --remove-config
 | `src/panel.ts` | 高级编辑、管理面板、应用配置、导出 |
 | `src/main.ts` | 入口、版本、系统副本跳转 |
 | `scripts/build.ts` | 生成完整单文件 |
+| `scripts/build-release.ts` | 固定 Bun 版本，编译三平台独立程序并生成 SHA-256 |
+| `scripts/smoke-release.ts`、`tests/executable-pty.py` | 无外部 Bun 的 CLI、后台、卸载和原生终端验证 |
+| `.github/workflows/release.yml` | 三平台构建和本机验证，全部通过后发布 tag release |
 | `tests/` | 模型、平台、守护、迁移、真实核心、PTY |
 
 仅开发需要依赖：
@@ -472,6 +508,32 @@ python3 tests/release-smoke.py --bun /absolute/path/to/bun
 2.3 增加防火墙计划、Windows PowerShell、Linux 三种管理器、规则归属、权限与取消、改端口及停止、安装迁移和后台状态回归。所有自动化防火墙测试均使用命令替身，不修改测试宿主机防火墙。最终计数、PowerShell 验证和 Windows 真机未验证范围见 `VALIDATION.md`。
 
 真实核心测试需要匹配清单的官方样本。环境变量、最终结果和未验证范围见 `VALIDATION.md`；缺少样本时会跳过，不计作真实协议通过。修改模块后须重新构建单文件。
+
+### 独立程序构建和发布
+
+开发与 CI 使用 `.bun-version` 中固定的 Bun **1.4.4**；终端用户只需要下载程序。
+
+```bash
+bun install --frozen-lockfile
+bun run typecheck
+bun test
+bun run build:release                  # 交叉构建全部三个平台
+bun run build:release --target linux-x64 # 或只构建一个目标
+bun run test:release                   # 只运行当前平台产物
+python3 tests/executable-pty.py dist/linux-x64/nexus-edge-linux-x64
+```
+
+Windows 的最后一项使用 `python -X utf8 tests/executable-pty.py dist/windows-x64/nexus-edge-windows-x64.exe`，测试依赖 `pywinpty==3.1.2`。Linux PTY 使用 Python 标准库。交叉编译成功只证明产物生成成功，不能代替在对应系统和 CPU 上运行测试。
+
+产物位于 `dist/<平台>/`，各自有 `SHA256SUMS`；`dist/common/` 包含完整源码、使用说明及许可。三个可执行文件采用 Bun `build --compile`，x64 选择 baseline 目标；不提供 macOS、Windows ARM64、32 位或 Alpine/musl 产物。
+
+**推送 `main` 即自动构建并发布新版本**，无需手工创建 tag：保持 `package.json` 与 `src/core.ts` 的 `APP_VERSION` 一致（例如 `3.0.0`），流水线将创建指向本次提交的 `v3.0.0` 标签及 Release。后续发布时提升这两处版本号，运行 `bun run build` 更新单文件后推送即可。版本号未改变时仍运行测试和构建，但保留已公开 Release，不覆盖原附件。
+
+PR 和手动触发只验证及上传临时 artifacts，不自动发布。显式推送版本匹配的 `v<版本>` 标签也受支持。发布依赖现有跨平台测试，以及 Windows x64、Linux x64、Linux arm64 各自的单元测试、可执行文件冒烟和原生 PTY。全部通过后重新验证附件 SHA-256，先建立 draft，全部附件上传成功才公开 Release。上传失败会留下草稿，同一提交重新运行失败作业可自动补齐；不同提交的草稿或指向其他提交的标签会明确拒绝。无需配置本机私钥或额外仓库 secret，发布 job 使用 GitHub 自动提供的 `GITHUB_TOKEN` 和限定的 `contents: write` 权限。
+
+Release 附带三个程序、完整单文件源码、README、项目许可、Bun 许可说明和统一 `SHA256SUMS`。`bun scripts/assemble-release.ts` 可在本地对 `dist/artifacts/executable-<平台>/` 下的同结构产物进行汇总及校验；不访问 GitHub。
+
+常见问题：Linux 下载后提示权限不足，先执行 `chmod +x`；提示架构不兼容，核对 `uname -m` 与下载平台；程序无法写入配置时，将它放到自己有写权限的目录。独立程序内含运行时，文件较大是正常现象。
 
 源码包不含核心二进制、生产配置、真实 Token 或 WARP 私钥。来源和组件说明见 `THIRD_PARTY.md`。
 

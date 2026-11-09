@@ -1,18 +1,27 @@
 import * as mainUrl from "node:url";
 import * as mainPath from "node:path";
-import { APP_VERSION, assertSupportedPlatform, createPaths, atomicWrite, errorMessage, type AppPaths } from "./core.ts";
+import { APP_VERSION, assertSupportedPlatform, createPaths, atomicWrite, errorMessage, isCompiledEntry, type AppPaths } from "./core.ts";
 import { runDaemonWorker, runCoreHost, stopDaemonGracefully } from "./daemon.ts";
 import { isAdministrator, discoverSystemInstallation, isSystemInstallation, runElevated, installedScriptVersion, updateSystemEntry, resolveUninstallTarget } from "./platform.ts";
 import { migrateSystemInstallation } from "./migration.ts";
-import { UserCancelledError, UiExitRequestedError, selectMenu } from "./ui.ts";
+import { UserCancelledError, UiExitRequestedError, selectMenu, withUiInputSession } from "./ui.ts";
 import { runPanel } from "./panel.ts";
 import { runFirewallRequest } from "./firewall-control.ts";
 import { runHostIpv6Helper } from "./ipv6.ts";
 import { confirmUninstall, requestUninstall } from "./uninstall.ts";
 
-export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
+// 由 release 构建器替换为 true；源码运行时未声明的标记通过 typeof 安全判断。
+declare const NEXUS_EDGE_COMPILED: boolean;
+
+/**
+ * 解析命令并启动面板或内部辅助进程。
+ * @param args 应用参数；Bun 和独立程序均从 argv 的第三项开始传递。
+ * @param entry 源码默认使用模块路径，编译后使用实际 exe 路径，避免写入 Bun 虚拟文件系统。
+ * @returns 进程退出码；异常由入口统一报告。
+ */
+export async function nexusMain(args = process.argv.slice(2), entry = typeof NEXUS_EDGE_COMPILED !== "undefined" && NEXUS_EDGE_COMPILED ? process.execPath : mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n--uninstall  卸载并询问是否保留配置（默认保留）\n  --keep-config / --remove-config  明确保留 / 删除配置，无交互执行\n  --local / --system  仅当前目录 / 显式系统安装；默认优先已激活系统副本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：直接运行下载的 nexus-edge 可执行文件，无需安装 Bun；源码版使用 bun nexus-edge.ts。\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64；仅源码版需要 Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n--local  打开当前便携目录，不跳转已安装系统副本\n--uninstall  卸载并询问是否保留配置（默认保留）\n  --keep-config / --remove-config  明确保留 / 删除配置，无交互执行\n  --local / --system  仅当前目录 / 显式系统安装；默认优先已激活系统副本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -24,7 +33,7 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
     const options = args.slice(1);
     if (options.some(option => !["--keep-config", "--remove-config", "--local", "--system"].includes(option)) || new Set(options).size !== options.length || (options.includes("--keep-config") && options.includes("--remove-config")) || (options.includes("--local") && options.includes("--system"))) throw new Error("卸载参数无效。使用 --uninstall [--keep-config | --remove-config] [--local | --system]。");
     const target = resolveUninstallTarget(paths, options.includes("--local") ? "local" : options.includes("--system") ? "system" : "default");
-    const keep = options.includes("--keep-config") ? true : options.includes("--remove-config") ? false : await confirmUninstall(target);
+    const keep = options.includes("--keep-config") ? true : options.includes("--remove-config") ? false : await withUiInputSession(() => confirmUninstall(target));
     if (keep !== null) await requestUninstall(target, keep, paths);
     else console.log("已取消卸载。");
     return 0;
@@ -39,7 +48,7 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   if (args[0] === "--stop-worker") { await stopDaemonGracefully(paths); return 0; }
   if (args[0] === "--update-system") {
     const result = await updateSystemEntry(paths);
-    console.log(`已更新系统脚本，原脚本备份：${result.backup}${result.configBackup ? `\n对应原配置备份：${result.configBackup}` : ""}\n现有后台保持运行；请在新版面板选择“启动 / 重启全部节点”应用新版本。\n如需回退旧版，请先停止后台，再同时恢复对应的脚本和配置。`);
+    console.log(`已更新系统程序，原程序备份：${result.backup}${result.configBackup ? `\n对应原配置备份：${result.configBackup}` : ""}\n请在新版面板选择“启动 / 重启全部节点”应用新版本。\n如需回退旧版，请先停止后台，再同时恢复对应的程序和配置。`);
     return 0;
   }
   if (args[0] === "--install-system") {
@@ -58,25 +67,34 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
       throw e;
     }
   }
-  if (args.length) throw new Error(`不识别的参数：${args[0]}。直接运行 bun nexus-edge.ts 即可打开面板。`);
+  const localPanel = args.length === 1 && args[0] === "--local";
+  if (args.length && !localPanel) throw new Error(`不识别的参数：${args[0]}。直接运行 NexusEdge 即可打开面板。`);
   let current: AppPaths = paths;
-  const system = discoverSystemInstallation();
+  const system = localPanel ? null : discoverSystemInstallation();
   if (system && !isSystemInstallation(paths)) {
     const installedVersion = installedScriptVersion(system.entry);
-    if (installedVersion !== APP_VERSION) {
-      const choice = await selectMenu("检测到不同版本的系统副本", `当前脚本：${APP_VERSION}；系统副本：${installedVersion ?? "未知版本"}。\n升级保留系统副本的配置、UUID、密钥及运行中的后台。`, ["使用当前脚本升级系统副本并打开面板", "打开已安装版本", "退出"]);
+    const sameFormat = isCompiledEntry(paths) === isCompiledEntry(system);
+    let openSystem = true;
+    if (!sameFormat) {
+      const choice = await withUiInputSession(() => selectMenu("检测到不同发布格式的系统副本", "独立程序与脚本版使用相同配置格式，但不直接覆盖彼此的系统安装。切换格式请先备份配置，保留配置卸载旧系统副本，再用新格式安装。当前便携目录使用自己的配置。", ["打开已安装版本", "打开当前便携版本", "退出"]));
+      if (choice === 2) return 0;
+      openSystem = choice === 0;
+    } else if (installedVersion !== APP_VERSION) {
+      const choice = await withUiInputSession(() => selectMenu("检测到不同版本的系统副本", `当前程序：${APP_VERSION}；系统副本：${installedVersion ?? "未知版本"}。\n升级保留系统副本的配置、UUID、密钥。Windows 独立程序升级前请停止后台并关闭系统面板。`, ["使用当前程序升级系统副本并打开面板", "打开已安装版本", "退出"]));
       if (choice === 2) return 0;
       if (choice === 0) await runElevated(paths, ["--update-system"]);
     }
-    console.log("打开系统副本的管理面板……");
-    await runElevated(createPaths(system.entry, system.runtime), []);
-    return 0;
+    if (openSystem) {
+      console.log("打开系统副本的管理面板……");
+      await runElevated(createPaths(system.entry, system.runtime), []);
+      return 0;
+    }
   }
   if (isSystemInstallation(current) && !await isAdministrator()) {
     console.log("系统副本由管理员管理；正在请求 UAC / sudo 授权……");
     await runElevated(current, []); return 0;
   }
-  const result = await runPanel(current);
+  const result = await withUiInputSession(() => runPanel(current));
   if (result === "handoff") {
     const target = discoverSystemInstallation();
     if (!target) throw new Error("无法定位系统副本。");

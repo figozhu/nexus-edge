@@ -6,6 +6,35 @@ export class UserCancelledError extends Error { constructor() { super("已取消
 export class UiExitRequestedError extends Error { constructor() { super("已退出管理面板。"); } }
 const uiAnsi = { reset: "\x1b[0m", cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m", dim: "\x1b[2m", bold: "\x1b[1m" };
 let uiKeyEventsInitialized = false;
+let uiWindowsInputSession = false;
+
+/**
+ * 为一段完整交互管理 Windows TTY 模式，避免菜单之间反复 raw/cooked 切换导致 Bun 停止读键。
+ * @param operation 同一交互会话中的异步操作；嵌套会话复用外层，不提前恢复输入。
+ * @returns operation 的结果；正常、取消及异常退出都会恢复原始模式并暂停读取。
+ * POSIX 和非 TTY 保持原行为。会话之外的 selectMenu 仍恢复每次调用前的模式。
+ */
+export async function withUiInputSession<T>(operation: () => Promise<T>): Promise<T> {
+  if (process.platform !== "win32" || !process.stdin.isTTY || uiWindowsInputSession) return operation();
+  const originalRaw = Boolean(process.stdin.isRaw);
+  uiWindowsInputSession = true;
+  if (!uiKeyEventsInitialized) { uiReadline.emitKeypressEvents(process.stdin); uiKeyEventsInitialized = true; }
+  // 菜单及 Readline 有各自的 Ctrl+C 处理器；无交互处理器的等待阶段沿用终端默认退出语义。
+  const onIdleKey = (_text: string, key: uiReadline.Key): void => {
+    if (key.ctrl && key.name === "c" && process.stdin.listenerCount("keypress") === 1) {
+      process.stdin.setRawMode(originalRaw); process.stdout.write("\x1b[?25h"); process.stdin.pause();
+      process.exit(130);
+    }
+  };
+  process.stdin.on("keypress", onIdleKey);
+  try { return await operation(); }
+  finally {
+    process.stdin.removeListener("keypress", onIdleKey);
+    process.stdin.setRawMode(originalRaw);
+    process.stdin.pause();
+    uiWindowsInputSession = false;
+  }
+}
 
 /**
  * 显示菜单并返回选中项的零基索引；initial 为默认项。
@@ -51,8 +80,12 @@ export async function selectMenu(title: string, information: string, choices: st
     const cleanup = () => {
       process.stdin.removeListener("keypress", onKey);
       process.stdin.removeListener("end", onEnd);
-      process.stdin.setRawMode(wasRaw);
-      process.stdin.pause();
+      if (!uiWindowsInputSession) process.stdin.setRawMode(wasRaw);
+      // Bun/Windows 的 TTY 在菜单多次 pause/resume 后可能停止投递 data，
+      // 即使 isRaw/flowing 显示正常也无法恢复。保留底层读取，仅释放事件循环引用；
+      // 下一次菜单/输入框重新 ref，应用最终退出时由 main 统一 pause。
+      if (process.platform === "win32") process.stdin.unref();
+      else process.stdin.pause();
       process.stdout.write("\x1b[?25h");
     };
     const onEnd = () => { cleanup(); reject(new UserCancelledError()); };
@@ -78,6 +111,7 @@ export async function selectMenu(title: string, information: string, choices: st
     process.stdin.on("keypress", onKey);
     process.stdin.once("end", onEnd);
     process.stdin.setRawMode(true);
+    if (process.platform === "win32") process.stdin.ref();
     process.stdin.resume();
     render();
   });
@@ -100,6 +134,7 @@ export async function promptInput(label: string, current = "", options: { secret
     rl.once("close", () => { if (!answered) { answered = true; reject(new UserCancelledError()); } });
     const prompt = `${label}${hint ? `（${hint}）` : ""}：`;
     if (hidden) process.stdout.write(prompt);
+    if (process.platform === "win32") process.stdin.ref();
     process.stdin.resume();
     rl.question(hidden ? "" : prompt, answer => {
       answered = true; rl.close();

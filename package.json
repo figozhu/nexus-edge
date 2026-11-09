@@ -1,6 +1,6 @@
 {
   "name": "nexus-edge",
-  "version": "2.3.3",
+  "version": "3.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -8,6 +8,8 @@
   "scripts": {
     "start": "bun nexus-edge.ts",
     "build": "bun scripts/build.ts",
+    "build:release": "bun scripts/build-release.ts",
+    "test:release": "bun scripts/smoke-release.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

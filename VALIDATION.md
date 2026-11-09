@@ -1,4 +1,33 @@
-# NexusEdge 2.3.3 验证报告
+# NexusEdge 3.0.0 独立程序与自动 Release 验证
+
+验证日期：2026-11-09。环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3、Python 3.12 / pywinpty 3.1.2。以下记录发布前的本地检查；GitHub 原生三平台执行及发布结果见 [Release workflow](https://github.com/figozhu/nexus-edge/actions/workflows/release.yml)。
+
+| 检查 | 结果 |
+| --- | --- |
+| 固定依赖安装、类型检查、单文件生成 | 通过；Bun 版本由 `.bun-version` 固定，源码与 package.json 版本均为 3.0.0 |
+| 全量单元 / 本机进程测试 | **534 通过、79 跳过、0 失败**；613 项、2916 断言 |
+| 三平台 `bun build --compile` | Windows x64、Linux x64 baseline、Linux arm64 均构建成功；PE/ELF 机器类型核对通过 |
+| Windows 发布程序，无外部 Bun PATH | help/version、无效参数拒绝、中文路径、不同 cwd、core-host 再启动自身、detached worker 空配置退出、SQLite 锁释放、保留/删除配置卸载均通过 |
+| 编译后的完整进程链路 | 编译 worker → 编译 core-host → 编译回环 HTTP 核心实际就绪、传输字节、认证 IPC 停止；核心 PID 确认结束；PATH 不含 Bun |
+| Windows 发布程序原生 ConPTY | 完整真实面板：IPv6 设置仅保存、返回主菜单、取消卸载、正常退出；没有网络或系统设置写入 |
+| 原有原生终端回归 | UI **6/6**、高级面板 **29/29**、简易面板 **15/15**、生成单文件高级面板 **29/29** 全部通过 |
+| 发布汇总与失败拒绝 | 三份产物汇总、8 个附件逐个 SHA-256 验证通过；错误 tag、损坏摘要均拒绝 |
+| Workflow 静态检查 | 两份 YAML 均通过 actionlint 1.7.12；未把静态检查当作 GitHub Actions 实际运行 |
+| 自动发布逻辑 | 6 项离线 API 回归通过：main 自动版本发布、已发布版本保留、失败草稿、同提交重试、提交/tag 冲突、触发来源约束 |
+| TUI 截图 | 三张真实 ConPTY 终端帧已生成并逐张检查；空配置，不含真实节点、地址或凭据；捕获进程正常退出 |
+| 平台适配回归 | 固定双布局、跨格式升级拒绝、UAC 空参数、任务/systemd 参数、二进制字节保留、占用保护及退出清理共 10 项通过 |
+
+新增终端回归发现 Bun 1.4.4 / Windows 连续菜单及 Readline 切换后，`stdin.pause()/resume()` 与反复 raw/cooked 切换可能不再投递原始 `data`，同时 JavaScript 状态仍显示 raw/flowing 正常。源码版和编译版均可复现。Windows 菜单使用 `unref()/ref()` 管理事件循环引用，真实完整交互通过 `withUiInputSession` 保持菜单间输入模式，会话结束、异常或取消时统一恢复并 pause，交接其他程序前释放输入。无活动菜单/Readline 时保留 Ctrl+C 退出能力。独立菜单调用及 POSIX 保持原模式恢复契约。含 Readline 保存与纯菜单返回的两条完整序列、全部原生交互回归和截图捕获均通过，没有加入延时绕过。
+
+系统二进制安装沿用固定受保护根目录和现有配置格式。Windows 程序被占用时不能覆盖升级，明确要求先停止后台并关闭系统面板；失败保持原文件。脚本与独立程序之间的系统格式转换在任何写入前拒绝，需备份并保留配置卸载后显式迁移。相关测试使用临时目录和受控 PowerShell 替身，没有更改生产系统副本、任务、防火墙、网卡或用户节点。
+
+**本地验证边界：** 本机没有 WSL / Linux 运行环境，Linux 两种架构仅完成交叉构建及文件格式核对，未执行其二进制。Release workflow 已要求在 Windows x64、Linux x64、Linux arm64 各自 runner 上完成单元测试、无 Bun 冒烟及原生 PTY，且依赖原跨平台测试全部成功后才发布。真实 Linux/systemd 安装、Windows 系统二进制安装升级全流程以及真实公网协议仍需对应环境验收；79 个跳过项不计为通过。编译回环核心是测试替身，不代表重新验收上游代理协议。
+
+本地产物：`dist/release/`；包含三个可执行文件、完整单文件源码、README、项目许可、Bun 许可说明及统一 `SHA256SUMS`。中间产物和编译缓存由 `.gitignore` 排除。测试与调试进程均在完成后清理。
+
+---
+
+# NexusEdge 2.3.3 验证报告（此前记录）
 
 验证日期：2026-11-09。执行环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3；原生终端使用 Python 3.12.14 / ConPTY / pywinpty 3.1.2。
 

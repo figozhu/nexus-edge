@@ -4,3 +4,5 @@ installation.json
 *.log
 __pycache__/
 *.py[cod]
+dist/
+.bun-cache/

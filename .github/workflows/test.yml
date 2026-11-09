@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -23,7 +24,7 @@ jobs:
       - name: 安装固定 Bun 版本
         uses: oven-sh/setup-bun@v2.2.0
         with:
-          bun-version: 1.4.4
+          bun-version-file: .bun-version
       - name: 安装锁定依赖
         run: bun install --frozen-lockfile
       - name: 构建单文件

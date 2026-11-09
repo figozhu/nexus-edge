@@ -2,7 +2,7 @@ import * as platformFs from "node:fs";
 import * as platformPath from "node:path";
 import * as platformCp from "node:child_process";
 import * as platformCrypto from "node:crypto";
-import { createPaths, atomicWrite, type AppPaths } from "./core";
+import { createPaths, atomicWrite, isCompiledEntry, appArguments, type AppPaths } from "./core";
 
 export interface StartupStatus {
   mode: "none" | "windows-system" | "windows-user" | "linux-system";
@@ -105,9 +105,40 @@ export function systemInstallRoot(): string {
   return platformCachedInstallRoot = platformPath.win32.join(programData, "NexusEdge");
 }
 
-function platformSystemPaths(): AppPaths {
-  const root = systemInstallRoot();
+/**
+ * 构造两种受支持的固定系统布局，不从安装标记接受任意程序路径。
+ * @param compiled true 为内置 Bun 的独立程序；false 为兼容旧版脚本与专用 Bun。
+ * @param root 系统根目录；测试可传入临时目录，仅构造路径，不访问系统。
+ * @returns 同一数据目录下的固定程序、运行时及配置路径。
+ */
+function platformSystemPaths(compiled = false, root = systemInstallRoot()): AppPaths {
+  if (compiled) {
+    const executable = platformPath.join(root, process.platform === "win32" ? "nexus-edge.exe" : "nexus-edge");
+    return createPaths(executable, executable);
+  }
   return createPaths(platformPath.join(root, "nexus-edge.ts"), platformPath.join(root, "runtime", process.platform === "win32" ? "bun.exe" : "bun"));
+}
+
+/**
+ * 将 schema 1 安装标记映射到允许的固定布局，绝不信任标记提供的外部路径。
+ * @param marker 未信任的 JSON 值；root 是已确定的系统根目录。
+ * @returns 严格匹配时返回标准路径，否则返回 null；active 由调用方单独判断。
+ */
+function platformPathsFromMarker(marker: unknown, root = systemInstallRoot()): AppPaths | null {
+  for (const compiled of [false, true]) {
+    const paths = platformSystemPaths(compiled, root);
+    if (platformInstallMarkerMatches(marker, paths)) return paths;
+  }
+  return null;
+}
+
+/**
+ * 在任何写入前阻止脚本与独立程序的系统布局直接互换，保留现有自启定义及配置。
+ * @param source 准备安装/升级的程序；target 已有系统副本。
+ * @returns 格式一致时无返回值；跨格式时给出保留配置的显式迁移方法。
+ */
+function platformRequireMatchingFormat(source: AppPaths, target: AppPaths): void {
+  if (isCompiledEntry(source) !== isCompiledEntry(target)) throw new Error("系统副本与当前入口的发布格式不同，不能直接覆盖升级。请先备份配置，使用旧版执行卸载并保留配置，再将保留的 config.json 复制到新版便携目录，验证节点后重新安装系统自启。");
 }
 
 function platformSamePath(a: string, b: string, os = process.platform): boolean {
@@ -115,7 +146,7 @@ function platformSamePath(a: string, b: string, os = process.platform): boolean 
 }
 
 function platformIsSystemPath(paths: AppPaths): boolean {
-  const installed = platformSystemPaths();
+  const installed = platformSystemPaths(isCompiledEntry(paths));
   return platformSamePath(paths.root, installed.root) && platformSamePath(paths.entry, installed.entry) && platformSamePath(paths.runtime, installed.runtime);
 }
 
@@ -199,10 +230,11 @@ function platformInstallMarkerActive(value: unknown, paths: AppPaths): boolean {
 
 export function discoverSystemInstallation(): { entry: string; runtime: string } | null {
   try {
-    const paths = platformSystemPaths();
-    const markerFile = platformPath.join(paths.root, platformInstallMarker);
-    if (!platformFs.existsSync(markerFile) || !platformFs.existsSync(paths.entry) || !platformFs.existsSync(paths.runtime)) return null;
+    const markerFile = platformPath.join(systemInstallRoot(), platformInstallMarker);
+    if (!platformFs.existsSync(markerFile)) return null;
     const marker = JSON.parse(platformFs.readFileSync(markerFile, "utf8"));
+    const paths = platformPathsFromMarker(marker);
+    if (!paths || !platformFs.existsSync(paths.entry) || !platformFs.existsSync(paths.runtime)) return null;
     if (!platformInstallMarkerActive(marker, paths) || !platformVerifyPublicInstall(paths)) return null;
     return { entry: paths.entry, runtime: paths.runtime };
   } catch { return null; }
@@ -216,10 +248,19 @@ function platformQuoteWindowsArg(value: string): string {
 
 function platformWindowsArguments(args: string[]): string { return args.map(platformQuoteWindowsArg).join(" "); }
 
+/**
+ * 检查可复制/提权的发布入口，独立程序不按 UTF-8 文本读取。
+ * @param paths 当前发布程序路径；独立程序允许用户更改下载文件名。
+ * @returns 无返回值；拒绝链接、特殊文件和非 PE/ELF 的伪二进制入口。
+ */
 function platformAssertStandaloneEntry(paths: AppPaths): void {
-  if (platformPath.basename(paths.entry).toLowerCase() !== "nexus-edge.ts") throw new Error("提权和系统托管必须使用已构建的单文件 nexus-edge.ts；请先执行 bun run build，再从项目根目录运行 bun nexus-edge.ts。");
   platformAssertNoLink(paths.entry);
-  if (!platformFs.lstatSync(paths.entry).isFile()) throw new Error("入口必须是普通 TypeScript 文件。");
+  if (!platformFs.lstatSync(paths.entry).isFile()) throw new Error("入口必须是普通文件。");
+  if (isCompiledEntry(paths)) {
+    if (!platformHasExecutableHeader(paths.entry)) throw new Error("独立程序入口不是有效的 Windows PE / Linux ELF 文件，请重新下载对应平台的 release。");
+    return;
+  }
+  if (platformPath.basename(paths.entry).toLowerCase() !== "nexus-edge.ts") throw new Error("提权和系统托管必须使用已构建的单文件 nexus-edge.ts 或独立可执行文件；源码请先执行 bun run build。");
   // A relative module dependency would be lost when the standalone script is copied.
   const source = platformFs.readFileSync(paths.entry, "utf8");
   if (/\b(?:from\s*|import\s*\(\s*|require\s*\(\s*)["']\.{1,2}\//.test(source) || /\bimport\s*["']\.{1,2}\//.test(source)) throw new Error("入口仍包含相对模块依赖，请使用构建后的完整单文件 nexus-edge.ts。");
@@ -232,9 +273,11 @@ function platformAssertStandaloneEntry(paths: AppPaths): void {
  * @returns 安全编码载荷后的 PowerShell 脚本；辅助程序隐藏窗口，UAC 授权仍由系统显示。
  */
 function platformBuildElevationScript(paths: AppPaths, args: string[]): string {
-  return platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, ...args]), root: paths.root }) + `
+  return platformPowerShellPayload({ runtime: paths.runtime, arguments: platformWindowsArguments(appArguments(paths, args)), root: paths.root }) + `
 try {
-  $child = Start-Process -FilePath $p.runtime -ArgumentList $p.arguments -WorkingDirectory $p.root -Verb RunAs -WindowStyle ${args.length === 0 ? "Normal" : "Hidden"} -PassThru -Wait
+  $argumentOptions = @{}
+  if ($p.arguments.Length -gt 0) { $argumentOptions.ArgumentList = $p.arguments }
+  $child = Start-Process -FilePath $p.runtime @argumentOptions -WorkingDirectory $p.root -Verb RunAs -WindowStyle ${args.length === 0 ? "Normal" : "Hidden"} -PassThru -Wait
   exit $child.ExitCode
 } catch {
   if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) { [Console]::Error.WriteLine('UAC 已取消，需要管理员权限的操作未执行。'); exit 1223 }
@@ -246,12 +289,12 @@ export async function runElevated(paths: AppPaths, args: string[]): Promise<void
   platformAssertStandaloneEntry(paths);
   let result: PlatformCommandResult;
   if (isAdministrator()) {
-    result = await platformCommand(paths.runtime, [paths.entry, ...args], { cwd: paths.root, inherit: true });
+    result = await platformCommand(paths.runtime, appArguments(paths, args), { cwd: paths.root, inherit: true });
   } else if (process.platform === "win32") {
     const script = platformBuildElevationScript(paths, args);
     result = await platformCommand(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(script))], { cwd: paths.root });
   } else if (process.platform === "linux") {
-    result = await platformCommand("sudo", ["--", paths.runtime, paths.entry, ...args], { cwd: paths.root, inherit: true });
+    result = await platformCommand("sudo", ["--", paths.runtime, ...appArguments(paths, args)], { cwd: paths.root, inherit: true });
   } else throw new Error("自动提权仅支持 Windows / Linux。");
   platformRequireSuccess(result, "提权后的操作");
 }
@@ -337,7 +380,13 @@ Check-Tree $p.bin
 export async function installSystemCopy(paths: AppPaths): Promise<AppPaths> {
   platformRequireAdministrator();
   platformAssertStandaloneEntry(paths);
-  const target = platformSystemPaths();
+  const target = platformSystemPaths(isCompiledEntry(paths));
+  const previousMarker = platformPath.join(target.root, platformInstallMarker);
+  if (platformFs.existsSync(previousMarker)) {
+    const previous = platformPathsFromMarker(JSON.parse(platformFs.readFileSync(previousMarker, "utf8")));
+    if (!previous) throw new Error("已有系统安装标记与固定程序路径不匹配，未覆盖安装。");
+    platformRequireMatchingFormat(paths, previous);
+  }
   if (platformIsSystemPath(paths)) { await deactivateSystemInstallation(paths); return target; }
   if (!platformFs.existsSync(paths.config) || !platformFs.existsSync(paths.bin)) throw new Error("请先在便携目录完成配置和内核下载、校验，再安装系统自启。");
   platformAssertTree(paths.bin);
@@ -360,7 +409,8 @@ export async function installSystemCopy(paths: AppPaths): Promise<AppPaths> {
   // Private directories must have their final ACL before secrets are copied into them.
   await platformProtectInstallation(target);
   platformCopyRegularTree(paths.entry, target.entry);
-  platformCopyRegularTree(platformFs.realpathSync(paths.runtime), target.runtime);
+  // 独立程序已内置 Bun，入口与运行时是同一文件，不复制第二份或依赖全局 Bun。
+  if (!isCompiledEntry(paths)) platformCopyRegularTree(platformFs.realpathSync(paths.runtime), target.runtime);
   platformCopyRegularTree(paths.bin, target.bin);
   if (platformFs.existsSync(target.config)) platformCopyRegularTree(target.config, target.config + ".bak");
   platformCopyRegularTree(paths.config, target.config);
@@ -369,46 +419,86 @@ export async function installSystemCopy(paths: AppPaths): Promise<AppPaths> {
   return target;
 }
 
+/**
+ * 仅读取文件头识别 PE/ELF，避免把大型编译程序当作脚本解码。
+ * @param entry 普通程序文件的绝对路径。
+ * @returns 命中 Windows PE 的 MZ 头或 Linux ELF 头时为 true；它不代替发布哈希校验。
+ */
+function platformHasExecutableHeader(entry: string): boolean {
+  const fd = platformFs.openSync(entry, "r");
+  try {
+    const header = Buffer.alloc(4);
+    const length = platformFs.readSync(fd, header, 0, 4, 0);
+    return length >= 2 && header[0] === 0x4d && header[1] === 0x5a || length === 4 && header.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+  } finally { platformFs.closeSync(fd); }
+}
+
+/**
+ * 读取发布版本；脚本保留旧版常量解析，独立程序使用有限时、有限输出的 --version。
+ * @param entry 已发现并通过受保护目录检查的系统入口；此函数不会下载或安装程序。
+ * @returns 三段数字版本，无法启动、超时或输出无效时返回 null。
+ */
 export function installedScriptVersion(entry: string): string | null {
   try {
+    platformAssertNoLink(entry);
+    if (platformHasExecutableHeader(entry)) {
+      const result = platformCp.spawnSync(entry, ["--version"], { cwd: platformPath.dirname(entry), encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 4096 });
+      const version = result.stdout?.trim();
+      return !result.error && result.status === 0 && /^\d+\.\d+\.\d+$/.test(version ?? "") ? version! : null;
+    }
     const source = platformFs.readFileSync(entry, "utf8");
     return source.match(/\bexport\s+const\s+APP_VERSION\s*=\s*["'](\d+\.\d+\.\d+)["']/)?.[1] ?? null;
   } catch { return null; }
 }
 
-/** Update only the protected script; keep the installed runtime, config and
- * active process untouched. Existing processes have already loaded their code.
- * The new panel migrates config and applies it through an explicit restart. */
+/**
+ * 升级同格式的受保护程序，并按原字节备份程序与配置，不修改自启定义。
+ * @param source 新下载的便携脚本或独立程序；不能是当前系统入口本身。
+ * @returns 系统路径、程序备份与可选配置备份。Windows 正在使用的 EXE 不会强制替换；
+ * 必须先停止后台并关闭系统面板，再从便携程序重试。跨格式转换须显式保留配置迁移。
+ */
 export async function updateSystemEntry(source: AppPaths): Promise<{ target: AppPaths; backup: string; configBackup?: string }> {
   platformRequireAdministrator();
   platformAssertStandaloneEntry(source);
   const discovered = discoverSystemInstallation();
   if (!discovered) throw new Error("没有可升级的已激活系统副本。");
   const target = createPaths(discovered.entry, discovered.runtime);
-  if (platformPath.resolve(source.entry) === platformPath.resolve(target.entry)) throw new Error("请从下载的新脚本发起升级。");
+  platformRequireMatchingFormat(source, target);
+  if (platformSamePath(source.entry, target.entry)) throw new Error("请从下载的新便携程序发起升级。");
   await platformAssertProtectedInstallation(target);
-  const oldSource = platformFs.readFileSync(target.entry, "utf8");
-  const newSource = platformFs.readFileSync(source.entry, "utf8");
+  const compiled = isCompiledEntry(target);
+  if (compiled && process.platform === "win32" && (await getStartupStatus(target)).running) throw new Error("Windows 独立程序正在运行。请先停止后台、关闭全部系统面板，再从新下载的便携 EXE 执行升级；原程序和配置未修改。");
+  // 使用 Buffer 保留可执行文件中的所有字节，防止 UTF-8 解码损坏二进制。
+  const oldSource = platformFs.readFileSync(target.entry);
+  const newSource = platformFs.readFileSync(source.entry);
   const backupDirectory = platformPath.join(target.data, "updates");
   platformFs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
   await platformProtectInstallation(target, backupDirectory);
-  const backup = platformPath.join(backupDirectory, `nexus-edge-${Date.now()}-${platformCrypto.randomBytes(4).toString("hex")}.ts`);
+  const stem = `nexus-edge-${Date.now()}-${platformCrypto.randomBytes(4).toString("hex")}`;
+  const extension = compiled ? (process.platform === "win32" ? ".exe" : ".bin") : ".ts";
+  const backup = platformPath.join(backupDirectory, stem + extension);
   atomicWrite(backup, oldSource);
   await platformProtectInstallation(target, backup);
-  const configBackup = platformFs.existsSync(target.config) ? backup.replace(/\.ts$/, ".config.json") : undefined;
+  const configBackup = platformFs.existsSync(target.config) ? platformPath.join(backupDirectory, stem + ".config.json") : undefined;
   if (configBackup) {
     platformAssertNoLink(target.config);
     atomicWrite(configBackup, platformFs.readFileSync(target.config));
     await platformProtectInstallation(target, configBackup);
   }
+  const mode = compiled ? 0o755 : 0o644;
   try {
-    atomicWrite(target.entry, newSource, 0o644);
+    atomicWrite(target.entry, newSource, mode);
     await platformProtectInstallation(target, target.entry);
     await platformAssertProtectedInstallation(target);
   } catch (error) {
-    try { atomicWrite(target.entry, oldSource, 0o644); await platformProtectInstallation(target, target.entry); }
-    catch (recoveryError) { throw new Error(`更新失败：${platformError(error)}；脚本恢复也失败：${platformError(recoveryError)}。原脚本备份：${backup}`); }
-    throw new Error(`更新失败，原脚本已恢复：${platformError(error)}`);
+    // Windows 对正在执行的 EXE 拒绝原子替换；原文件未变时不尝试再次覆盖它。
+    const unchanged = platformFs.existsSync(target.entry) && platformFs.readFileSync(target.entry).equals(oldSource);
+    if (!unchanged) {
+      try { atomicWrite(target.entry, oldSource, mode); await platformProtectInstallation(target, target.entry); }
+      catch (recoveryError) { throw new Error(`更新失败：${platformError(error)}；程序恢复也失败：${platformError(recoveryError)}。原程序备份：${backup}`); }
+    }
+    const advice = compiled && process.platform === "win32" ? " 请关闭所有系统面板并停止后台，再从便携 EXE 重试。" : "";
+    throw new Error(`更新失败，原程序${unchanged ? "保持不变" : "已恢复"}：${platformError(error)}。${advice}`);
   }
   return { target, backup, ...(configBackup ? { configBackup } : {}) };
 }
@@ -441,7 +531,7 @@ interface PlatformTaskSnapshot {
 
 function platformTaskSpec(paths: AppPaths, mode: "system" | "user"): PlatformTaskSpec {
   const identity = platformCrypto.createHash("sha256").update(platformPath.win32.resolve(paths.root).toLowerCase()).digest("hex").slice(0, 16);
-  return { name: mode === "system" ? "NexusEdge-System" : `NexusEdge-User-${identity}`, marker: `NexusEdge/v1/${identity}/${mode}`, mode, runtime: paths.runtime, arguments: platformWindowsArguments([paths.entry, "--worker"]), root: paths.root };
+  return { name: mode === "system" ? "NexusEdge-System" : `NexusEdge-User-${identity}`, marker: `NexusEdge/v1/${identity}/${mode}`, mode, runtime: paths.runtime, arguments: platformWindowsArguments(appArguments(paths, ["--worker"])), root: paths.root };
 }
 
 const platformGetTaskCode = `$t = Get-ScheduledTask -TaskPath '\\' | Where-Object { $_.TaskName -ieq $p.name } | Select-Object -First 1\n`;
@@ -554,7 +644,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 WorkingDirectory=${platformSystemdWorkingDirectory(paths.root)}
-ExecStart=${[paths.runtime, paths.entry, "--worker"].map(value => platformQuoteSystemd(value, true)).join(" ")}
+ExecStart=${[paths.runtime, ...appArguments(paths, ["--worker"])].map(value => platformQuoteSystemd(value, true)).join(" ")}
 Restart=on-failure
 RestartSec=3
 KillMode=control-group
@@ -685,7 +775,7 @@ export async function stopManaged(paths: AppPaths): Promise<void> {
   if (process.platform === "win32") {
     const spec = await platformOwnedWindowsTask(paths);
     // Stop-ScheduledTask terminates immediately. Give our authenticated local IPC time to stop both cores.
-    platformRequireSuccess(await platformCommand(paths.runtime, [paths.entry, "--stop-worker"], { cwd: paths.root, timeoutMs: 25000 }), "后台正常停止");
+    platformRequireSuccess(await platformCommand(paths.runtime, appArguments(paths, ["--stop-worker"]), { cwd: paths.root, timeoutMs: 25000 }), "后台正常停止");
     const deadline = Date.now() + 15000;
     do {
       const task = await platformReadTask(spec);
@@ -721,10 +811,11 @@ export function assertUninstallTarget(paths: AppPaths): void {
  * @returns 使用安装标记中固定运行时的路径。显式系统目标不存在时抛错，不回退删除便携数据。
  */
 export function resolveUninstallTarget(source: AppPaths, scope: "default" | "local" | "system" = "default"): AppPaths {
-  const system = platformSystemPaths();
-  if (platformSamePath(source.root, system.root) || scope === "system") {
-    const marker = JSON.parse(platformFs.readFileSync(platformPath.join(system.root, platformInstallMarker), "utf8"));
-    if (!platformInstallMarkerMatches(marker, system) || !platformVerifyPublicInstall(system)) throw new Error("系统卸载目标的标记或保护权限无效。");
+  const root = systemInstallRoot();
+  if (platformSamePath(source.root, root) || scope === "system") {
+    const marker = JSON.parse(platformFs.readFileSync(platformPath.join(root, platformInstallMarker), "utf8"));
+    const system = platformPathsFromMarker(marker);
+    if (!system || !platformVerifyPublicInstall(system)) throw new Error("系统卸载目标的标记或保护权限无效。");
     return system;
   }
   const installed = scope === "default" ? discoverSystemInstallation() : null;
@@ -761,7 +852,7 @@ export async function uninstallStartup(paths: AppPaths): Promise<void> {
     if (!platformTaskOwnership(spec, task)) throw new Error("同名计划任务不属于此安装，未执行卸载。");
     await platformPowerShell(platformBuildUninstallTaskScript(spec, false));
     // 通过认证 IPC 正常停止，避免 Stop-ScheduledTask 直接终止后遗留核心。
-    platformRequireSuccess(await platformCommand(paths.runtime, [paths.entry, "--stop-worker"], { cwd: paths.root, timeoutMs: 25000 }), "卸载前停止后台");
+    platformRequireSuccess(await platformCommand(paths.runtime, appArguments(paths, ["--stop-worker"]), { cwd: paths.root, timeoutMs: 25000 }), "卸载前停止后台");
     const deadline = Date.now() + 15000;
     while (true) {
       const latest = await platformReadTask(spec);
@@ -785,15 +876,15 @@ export async function uninstallStartup(paths: AppPaths): Promise<void> {
 }
 
 /**
- * 构建 Windows 退出后的专用 Bun 清理程序；只删除固定文件，绝不递归删除安装根目录。
+ * 构建 Windows 退出后的程序清理脚本；只删除固定独立 EXE 或旧版专用 Bun，绝不递归删除安装根目录。
  * @param paths 已验证的系统安装路径。文件占用时最多重试 60 秒，失败写入根目录日志。
  * @returns PowerShell 程序；所有路径通过数据载荷传入，并在删除前拒绝重解析点。
  */
 function platformBuildRuntimeCleanup(paths: AppPaths): string {
-  return platformPowerShellPayload({ root: paths.root, runtime: paths.runtime }) + `
+  return platformPowerShellPayload({ root: paths.root, runtime: paths.runtime, compiled: isCompiledEntry(paths) }) + `
 $root = [IO.Path]::GetFullPath($p.root)
 $runtime = [IO.Path]::GetFullPath($p.runtime)
-$expected = [IO.Path]::Combine($root, 'runtime', 'bun.exe')
+$expected = if ($p.compiled) { [IO.Path]::Combine($root, 'nexus-edge.exe') } else { [IO.Path]::Combine($root, 'runtime', 'bun.exe') }
 if (-not $runtime.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { throw '运行时清理路径不匹配。' }
 for ($attempt = 0; $attempt -lt 120; $attempt++) {
   try {
@@ -811,7 +902,7 @@ for ($attempt = 0; $attempt -lt 120; $attempt++) {
     exit 0
   } catch { $failure = $_.Exception.Message; Start-Sleep -Milliseconds 500 }
 }
-[IO.File]::WriteAllText([IO.Path]::Combine($root, 'uninstall-error.log'), '运行时清理失败，请关闭其他 NexusEdge 面板后手动删除 runtime/bun.exe：' + $failure)
+[IO.File]::WriteAllText([IO.Path]::Combine($root, 'uninstall-error.log'), '程序清理失败，请关闭其他 NexusEdge 面板后手动删除 ' + $runtime + '：' + $failure)
 exit 1
 `;
 }
@@ -824,8 +915,10 @@ exit 1
 export async function removeInstalledProgram(paths: AppPaths): Promise<boolean> {
   if (!platformIsSystemPath(paths)) return false;
   assertUninstallTarget(paths);
-  // 先删除入口，最后移除标记；失败时下一次仍可诊断，而不会误删其他目录。
-  platformFs.unlinkSync(paths.entry);
+  // Windows 正在使用的独立 EXE 必须交给退出清理脚本，不能在当前进程内删除。
+  // 脚本模式入口与运行时不同；Linux 独立程序只删除一次，避免重复 unlink。
+  const compiled = isCompiledEntry(paths);
+  if (!compiled || process.platform !== "win32") platformFs.unlinkSync(paths.entry);
   platformFs.unlinkSync(platformPath.join(paths.root, platformInstallMarker));
   if (process.platform === "win32") {
     const child = platformCp.spawn(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(platformBuildRuntimeCleanup(paths)))], { cwd: platformPath.dirname(paths.root), detached: true, windowsHide: true, stdio: "ignore" });
@@ -833,8 +926,8 @@ export async function removeInstalledProgram(paths: AppPaths): Promise<boolean> 
     child.unref();
     return true;
   }
-  platformFs.unlinkSync(paths.runtime);
-  for (const directory of [platformPath.dirname(paths.runtime), paths.root]) if (platformFs.readdirSync(directory).length === 0) platformFs.rmdirSync(directory);
+  if (!compiled) platformFs.unlinkSync(paths.runtime);
+  for (const directory of new Set([platformPath.dirname(paths.runtime), paths.root])) if (platformFs.existsSync(directory) && platformFs.readdirSync(directory).length === 0) platformFs.rmdirSync(directory);
   return false;
 }
 
@@ -849,4 +942,6 @@ export const platformInternals = {
   systemdWorkingDirectory: platformSystemdWorkingDirectory,
   copyRegularTree: platformCopyRegularTree, linuxProtected: platformLinuxProtected,
   makeInstallMarker: platformMakeInstallMarker, installMarkerActive: platformInstallMarkerActive,
+  systemPaths: platformSystemPaths, pathsFromMarker: platformPathsFromMarker, requireMatchingFormat: platformRequireMatchingFormat,
+  assertStandaloneEntry: platformAssertStandaloneEntry,
 };

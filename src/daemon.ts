@@ -6,7 +6,7 @@ import * as daemonNet from "node:net";
 import * as daemonHttp from "node:http";
 import * as daemonDgram from "node:dgram";
 import * as daemonSqlite from "bun:sqlite";
-import { isCoreIpv6Enabled } from "./core.ts";
+import { isCoreIpv6Enabled, appArguments } from "./core.ts";
 import { type AppConfig, type AppPaths, type RuntimeRecord, type DaemonStatus, type NodeConfig, type NodeRuntimeStatus, type CoreName, type CoreRuntimeStatus, type CoreProcessState, atomicWrite, ensureDataDir, readConfig, validateConfig, configFingerprint, runtimeConfigFingerprint, collectConfigSecrets, generateNodeLinks, nodeEngine, nodeListenNetworks, normalizeDomain, LineBuffer, redact, errorMessage, delay } from "./core.ts";
 import { ensureBinaries, preflightCores, buildCloudflaredArgs, readCoreSelection, initializeCoreSelection, coreReleaseFingerprint, type Binaries } from "./network.ts";
 import { syncFirewallBackground } from "./firewall-control.ts";
@@ -103,7 +103,7 @@ export async function startDetachedDaemon(paths: AppPaths): Promise<void> {
   const fd = daemonFs.openSync(paths.log, "a", 0o600);
   try {
     await new Promise<void>((resolve, reject) => {
-      const child = daemonCp.spawn(paths.runtime, [paths.entry, "--worker"], {
+      const child = daemonCp.spawn(paths.runtime, appArguments(paths, ["--worker"]), {
         cwd: paths.root, shell: false, detached: true, windowsHide: true,
         stdio: ["ignore", fd, fd],
       });
@@ -477,7 +477,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         if (job.nodeId && nodeConfigs.get(job.nodeId)!.tunnel.mode === "quick") nodeStates.get(job.nodeId)!.domain = null;
         const spawnTime = Date.now();
         logger!.write(`[${job.key}] 启动核心。`);
-        const child = daemonCp.spawn(paths.runtime, [paths.entry, "--core-host", job.command.executable, ...job.command.args, ...job.args], {
+        const child = daemonCp.spawn(paths.runtime, appArguments(paths, ["--core-host", job.command.executable, ...job.command.args, ...job.args]), {
           cwd: runDirectory, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
         });
         children.add(child);
