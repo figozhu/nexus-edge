@@ -15,6 +15,7 @@ import { syncFirewallInteractive } from "./firewall-control.ts";
 import { firewallPanelSummary, printFirewallResult, requireFirewallApply, runFirewallPanel } from "./firewall-panel.ts";
 import { isCoreIpv6Enabled } from "./core.ts";
 import { runHostIpv6Panel } from "./ipv6-panel.ts";
+import { confirmUninstall, requestUninstall } from "./uninstall.ts";
 
 const panelProtocolLabels: Record<NodeProtocol, string> = {
   vless: "VLESS", vmess: "VMess", shadowsocks: "Shadowsocks / SS2022", trojan: "Trojan",
@@ -636,7 +637,7 @@ async function panelNetworkSettings(paths: AppPaths): Promise<void> {
   }
 }
 
-export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
+export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "uninstalled"> {
   if (!process.stdin.isTTY) throw new Error("管理面板需要交互式 PowerShell / cmd / Windows Terminal / Linux 终端。");
   for (;;) {
     const config = readConfig(paths);
@@ -652,8 +653,8 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "退出面板（保留后台）"]);
-    if (choice === 9) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "退出面板（保留后台）"]);
+    if (choice === 10) return "exit";
     try {
       if (choice === 0) {
         if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
@@ -667,6 +668,12 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
       else if (choice === 8) { await panelNetworkSettings(paths); continue; }
+      else if (choice === 9) {
+        const keep = await confirmUninstall(paths);
+        if (keep === null) continue;
+        await requestUninstall(paths, keep);
+        return "uninstalled";
+      }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;

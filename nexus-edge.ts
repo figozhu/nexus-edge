@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 2.3.2 — 按需编辑节点、REALITY 单次域名输入与跨平台终端交互。
+ * NexusEdge 2.3.3 — 字母快捷菜单与跨平台卸载、可选保留配置。
  * Run: bun nexus-edge.ts
  * Requires Bun >= 1.4.3; Windows x64 / Linux x64, arm64.
  * Generated from the typed source modules using scripts/build.ts.
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "2.3.2";
+export const APP_VERSION = "2.3.3";
 
 export interface WarpProfile {
   privateKey: string;
@@ -3277,12 +3277,150 @@ export async function stopManaged(paths: AppPaths): Promise<void> {
 
 export async function restartManaged(paths: AppPaths): Promise<void> { await stopManaged(paths); await startManaged(paths); }
 
+/**
+ * 验证卸载目标的目录与系统安装标记；不依赖节点配置是否完整。
+ * @param paths 当前入口对应的路径。系统路径要求管理员及受保护的真实安装。
+ * @returns 校验通过时无返回值；拒绝链接、伪造标记和非受保护的系统目录。
+ */
+export function assertUninstallTarget(paths: AppPaths): void {
+  platformAssertNoLinkAncestors(paths.data);
+  if (platformSamePath(paths.root, platformSystemPaths().root) && !platformIsSystemPath(paths)) throw new Error("系统目录必须使用其专用入口和运行时卸载，请重新运行 --uninstall 解析正确目标。");
+  if (!platformIsSystemPath(paths)) return;
+  platformRequireAdministrator();
+  const marker = JSON.parse(platformFs.readFileSync(platformPath.join(paths.root, platformInstallMarker), "utf8"));
+  if (!platformInstallMarkerMatches(marker, paths) || !platformVerifyPublicInstall(paths)) throw new Error("系统安装归属或目录权限不匹配，未执行卸载。");
+}
+
+/**
+ * 解析卸载目标，兼容使用全局 Bun 打开系统入口以及新版便携脚本卸载旧系统副本。
+ * @param source 当前执行脚本；scope 为自动发现、仅当前目录或显式系统安装。
+ * @returns 使用安装标记中固定运行时的路径。显式系统目标不存在时抛错，不回退删除便携数据。
+ */
+export function resolveUninstallTarget(source: AppPaths, scope: "default" | "local" | "system" = "default"): AppPaths {
+  const system = platformSystemPaths();
+  if (platformSamePath(source.root, system.root) || scope === "system") {
+    const marker = JSON.parse(platformFs.readFileSync(platformPath.join(system.root, platformInstallMarker), "utf8"));
+    if (!platformInstallMarkerMatches(marker, system) || !platformVerifyPublicInstall(system)) throw new Error("系统卸载目标的标记或保护权限无效。");
+    return system;
+  }
+  const installed = scope === "default" ? discoverSystemInstallation() : null;
+  return installed ? createPaths(installed.entry, installed.runtime) : source;
+}
+
+/**
+ * 为已核对归属的 Windows 任务构建关闭或注销操作；不存在的任务视为已处理。
+ * @param spec 由当前安装生成的任务定义；remove 为 true 时要求任务已停止。
+ * @returns 带归属检查的 PowerShell 程序，不强杀进程或删除同名外部任务。
+ */
+function platformBuildUninstallTaskScript(spec: PlatformTaskSpec, remove: boolean): string {
+  return platformPowerShellPayload(spec) + platformGetTaskCode + platformAssertTaskOwnerCode + (remove ? `
+if ($t) {
+  if ([string]$t.State -in @('Running', 'Queued', '4', '2')) { throw '计划任务仍在运行，未注销。' }
+  Unregister-ScheduledTask -TaskName $p.name -TaskPath '\\' -Confirm:$false
+}
+` : `
+if ($t) { Disable-ScheduledTask -TaskName $p.name -TaskPath '\\' | Out-Null }
+`);
+}
+
+/**
+ * 先关闭自动触发，再正常停止并注销本安装的托管定义。
+ * @param paths 卸载目标；便携 Linux 没有系统服务，不触碰其他安装。
+ * @returns 完成的 Promise；归属冲突、停止失败或注销失败会抛错，数据由调用方保留。
+ */
+export async function uninstallStartup(paths: AppPaths): Promise<void> {
+  assertUninstallTarget(paths);
+  if (process.platform === "win32") {
+    const spec = platformTaskSpec(paths, platformIsSystemPath(paths) ? "system" : "user");
+    const task = await platformReadTask(spec);
+    if (!task) return;
+    if (!platformTaskOwnership(spec, task)) throw new Error("同名计划任务不属于此安装，未执行卸载。");
+    await platformPowerShell(platformBuildUninstallTaskScript(spec, false));
+    // 通过认证 IPC 正常停止，避免 Stop-ScheduledTask 直接终止后遗留核心。
+    platformRequireSuccess(await platformCommand(paths.runtime, [paths.entry, "--stop-worker"], { cwd: paths.root, timeoutMs: 25000 }), "卸载前停止后台");
+    const deadline = Date.now() + 15000;
+    while (true) {
+      const latest = await platformReadTask(spec);
+      if (!latest || !["Running", "Queued", "4", "2"].includes(latest.state)) break;
+      if (Date.now() >= deadline) throw new Error("计划任务停止超时，已保留程序和数据。请检查后台日志后重试卸载。");
+      await platformDelay(250);
+    }
+    await platformPowerShell(platformBuildUninstallTaskScript(spec, true));
+    if (await platformReadTask(spec)) throw new Error("计划任务注销后仍然存在，已保留数据。");
+  } else if (process.platform === "linux" && platformIsSystemPath(paths) && platformFs.existsSync(platformUnitFile)) {
+    platformRequireLinuxManager(paths);
+    await platformLinuxStatus(paths);
+    await platformSystemctl(["disable", platformUnitName]);
+    await platformSystemctl(["stop", platformUnitName]);
+    const state = await platformLinuxStatus(paths);
+    if (state.running) throw new Error("systemd 服务仍在运行，已保留 unit 和数据。");
+    platformAssertUnitOwner(paths);
+    platformFs.unlinkSync(platformUnitFile);
+    await platformSystemctl(["daemon-reload"]);
+  }
+}
+
+/**
+ * 构建 Windows 退出后的专用 Bun 清理程序；只删除固定文件，绝不递归删除安装根目录。
+ * @param paths 已验证的系统安装路径。文件占用时最多重试 60 秒，失败写入根目录日志。
+ * @returns PowerShell 程序；所有路径通过数据载荷传入，并在删除前拒绝重解析点。
+ */
+function platformBuildRuntimeCleanup(paths: AppPaths): string {
+  return platformPowerShellPayload({ root: paths.root, runtime: paths.runtime }) + `
+$root = [IO.Path]::GetFullPath($p.root)
+$runtime = [IO.Path]::GetFullPath($p.runtime)
+$expected = [IO.Path]::Combine($root, 'runtime', 'bun.exe')
+if (-not $runtime.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { throw '运行时清理路径不匹配。' }
+for ($attempt = 0; $attempt -lt 120; $attempt++) {
+  try {
+    foreach ($itemPath in @($root, [IO.Path]::GetDirectoryName($runtime), $runtime)) {
+      if (Test-Path -LiteralPath $itemPath) {
+        if (((Get-Item -LiteralPath $itemPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw '清理路径已变为重解析点。' }
+      }
+    }
+    # 出现新的安装标记说明期间已重新安装，必须保留新运行时。
+    if (Test-Path -LiteralPath ([IO.Path]::Combine($root, 'installation.json'))) { exit 0 }
+    if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Force -ErrorAction Stop }
+    foreach ($directory in @([IO.Path]::GetDirectoryName($runtime), $root)) {
+      if ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { [IO.Directory]::Delete($directory, $false) }
+    }
+    exit 0
+  } catch { $failure = $_.Exception.Message; Start-Sleep -Milliseconds 500 }
+}
+[IO.File]::WriteAllText([IO.Path]::Combine($root, 'uninstall-error.log'), '运行时清理失败，请关闭其他 NexusEdge 面板后手动删除 runtime/bun.exe：' + $failure)
+exit 1
+`;
+}
+
+/**
+ * 清理系统安装的入口、标记和专用运行时；便携下载文件及全局 Bun 保留。
+ * @param paths 已完成服务、规则和数据清理的目标。
+ * @returns Windows 正占用的 Bun 是否已交给隐藏辅助进程在退出后清理。
+ */
+export async function removeInstalledProgram(paths: AppPaths): Promise<boolean> {
+  if (!platformIsSystemPath(paths)) return false;
+  assertUninstallTarget(paths);
+  // 先删除入口，最后移除标记；失败时下一次仍可诊断，而不会误删其他目录。
+  platformFs.unlinkSync(paths.entry);
+  platformFs.unlinkSync(platformPath.join(paths.root, platformInstallMarker));
+  if (process.platform === "win32") {
+    const child = platformCp.spawn(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(platformBuildRuntimeCleanup(paths)))], { cwd: platformPath.dirname(paths.root), detached: true, windowsHide: true, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+    return true;
+  }
+  platformFs.unlinkSync(paths.runtime);
+  for (const directory of [platformPath.dirname(paths.runtime), paths.root]) if (platformFs.readdirSync(directory).length === 0) platformFs.rmdirSync(directory);
+  return false;
+}
+
 /** 测试用纯构建器和校验辅助；真实计划任务验收仅在显式启用的 Windows 集成测试中执行。 */
 export const platformInternals = {
   quoteWindowsArg: platformQuoteWindowsArg, windowsArguments: platformWindowsArguments,
   encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload, powerShellProgram: platformPowerShellProgram,
   taskSpec: platformTaskSpec, buildTaskScript: platformBuildTaskScript, assessTask: platformAssessTask,
   buildElevationScript: platformBuildElevationScript,
+  buildUninstallTaskScript: platformBuildUninstallTaskScript, buildRuntimeCleanup: platformBuildRuntimeCleanup,
   systemdUnit: platformSystemdUnit, quoteSystemd: platformQuoteSystemd,
   systemdWorkingDirectory: platformSystemdWorkingDirectory,
   copyRegularTree: platformCopyRegularTree, linuxProtected: platformLinuxProtected,
@@ -3977,12 +4115,20 @@ async function linuxIptablesCheckNft(s: LinuxFirewallSession): Promise<void> {
   });
   if (conflicts.length) linuxFirewallFail("unsupported", `检测到原生 nftables input 链（${conflicts.join("、")}）。独立 iptables ACCEPT 无法保证绕过其 DROP 策略，请在现有 nftables 管理配置中放行这些端口。`);
 }
+/**
+ * 对当前安装的有限 iptables 计划执行检查或同步；空计划用于停止/卸载时清理。
+ * @param s 已完成后端与归属记录验证的会话；apply 为 false 时只查询。
+ * @returns 同步结果；有历史归属但工具缺失时拒绝假定规则已消失。
+ */
 async function linuxIptablesSync(s: LinuxFirewallSession, apply: boolean): Promise<FirewallResult> {
-  await linuxIptablesCheckNft(s);
+  // 空计划只移除归属明确的规则，不需要证明新增 ACCEPT 能绕过其他 nftables 策略。
+  // 仍逐条校验自己的链和引用，绝不修改原生 nftables 或其他安装的规则。
+  if (s.plan.rules.length) await linuxIptablesCheckNft(s);
   let snapshots = await Promise.all(([4, 6] as const).map(family => linuxIptablesSnapshot(s, family)));
   for (const rule of s.plan.rules) if (!snapshots.find(snapshot => snapshot.family === rule.family)?.available) linuxFirewallFail("unsupported", `当前系统缺少 ${rule.family === 4 ? "iptables" : "ip6tables"}，无法自动处理所需的 IPv${rule.family} 端口。`);
-  if (!snapshots.some(snapshot => snapshot.available)) return linuxFirewallResult(s, "inactive", "未检测到正在管理本机端口的 UFW、firewalld 或可用的 iptables；未创建防火墙策略。");
-  if (!snapshots.some(snapshot => snapshot.active)) return linuxFirewallResult(s, "inactive", "iptables INPUT 当前未设置过滤规则且默认允许入站，无需额外放行；工具不会替您启用防火墙。");
+  if (!s.plan.rules.length && s.journal?.backend === "iptables" && snapshots.some(snapshot => !snapshot.available)) linuxFirewallFail("unsupported", "本安装曾使用 iptables，但当前无法查询全部地址族的规则。请恢复 iptables / ip6tables 后重试清理，归属记录已保留。");
+  if (!snapshots.some(snapshot => snapshot.available)) return linuxFirewallResult(s, s.plan.rules.length ? "inactive" : "synced", "未检测到可用的 iptables，也没有本安装待清理的规则归属记录；未创建防火墙策略。");
+  if (s.plan.rules.length && !snapshots.some(snapshot => snapshot.active)) return linuxFirewallResult(s, "inactive", "iptables INPUT 当前未设置过滤规则且默认允许入站，无需额外放行；工具不会替您启用防火墙。");
   s.warnings.push("iptables 规则仅在当前内核运行期生效；本工具以管理员权限启动时会重新同步。不会保存或覆盖系统的整个规则集。");
   s.warnings.push("此状态验证本机 filter/INPUT 规则；其他内核过滤路径、路由和云安全组仍可能影响连通性。");
   const changed = snapshots.some(snapshot => {
@@ -4113,7 +4259,7 @@ export async function transferLinuxUfwOwnership(sourcePlan: FirewallPlan, target
   finally { release?.(); }
 }
 
-export const linuxFirewallInternals = { key: linuxFirewallKey, ufwComment: linuxUfwComment, ufwSpec: linuxUfwSpec, ufwParseStatus: linuxUfwParseStatus, richRule: linuxFirewalldRichRule, chain: linuxIptablesChain, iptablesRule: linuxIptablesRule, iptablesOwner: linuxIptablesOwner, iptablesJump: linuxIptablesJump, words: linuxFirewallWords };
+export const linuxFirewallInternals = { key: linuxFirewallKey, ufwComment: linuxUfwComment, ufwSpec: linuxUfwSpec, ufwParseStatus: linuxUfwParseStatus, richRule: linuxFirewalldRichRule, chain: linuxIptablesChain, iptablesRule: linuxIptablesRule, iptablesOwner: linuxIptablesOwner, iptablesJump: linuxIptablesJump, words: linuxFirewallWords, iptablesSync: linuxIptablesSync };
 
 
 // ==================== firewall.ts ====================
@@ -5900,16 +6046,31 @@ export class UiExitRequestedError extends Error { constructor() { super("已退�
 const uiAnsi = { reset: "\x1b[0m", cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m", dim: "\x1b[2m", bold: "\x1b[1m" };
 let uiKeyEventsInitialized = false;
 
-/** Raw mode is scoped to one menu. Every exit path restores the cursor and stdin. */
+/**
+ * 显示菜单并返回选中项的零基索引；initial 为默认项。
+ * TTY 每页最多 26 项，字母不区分大小写，方向键跨页移动；非 TTY 输入字母序号后回车。
+ * 数字 1–9 保留为当前页前九项的兼容快捷键；j/k 现在分别选择第十/十一项。
+ * 所有退出路径均恢复 raw mode、光标和监听器；空菜单直接报错。
+ */
 export async function selectMenu(title: string, information: string, choices: string[], initial = 0): Promise<number> {
+  if (!choices.length) throw new Error("菜单至少需要一个选项。");
+  const pageSize = 26;
+  const label = (index: number): string => {
+    // 非 TTY 的完整列表使用 a…z、aa…az 等序号，输入整行后才解析，不会误选 a。
+    let result = "";
+    for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26)) result = String.fromCharCode(97 + (value - 1) % 26) + result;
+    return result;
+  };
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.log(`\n${title}\n${information}`);
-    choices.forEach((item, index) => console.log(`${index + 1}. ${item}`));
+    choices.forEach((item, index) => console.log(`${label(index)}. ${item}`));
     for (;;) {
-      const answer = await promptInput("输入选项编号", String(initial + 1));
+      const answer = (await promptInput("输入选项字母", label(initial))).toLowerCase();
+      const letterIndex = choices.findIndex((_, index) => label(index) === answer);
+      if (letterIndex >= 0) return letterIndex;
       const n = Number(answer);
       if (Number.isInteger(n) && n >= 1 && n <= choices.length) return n - 1;
-      console.log("请输入列表中的编号。");
+      console.log("请输入列表中的字母。");
     }
   }
   if (!uiKeyEventsInitialized) { uiReadline.emitKeypressEvents(process.stdin); uiKeyEventsInitialized = true; }
@@ -5921,8 +6082,10 @@ export async function selectMenu(title: string, information: string, choices: st
       console.log(`${uiAnsi.bold}${uiAnsi.cyan}NexusEdge ${APP_VERSION}${uiAnsi.reset}\n`);
       if (information) console.log(information + "\n");
       console.log(`${uiAnsi.bold}${title}${uiAnsi.reset}\n`);
-      choices.forEach((choice, index) => console.log(index === selected ? `${uiAnsi.cyan}  › ${index + 1}. ${choice}${uiAnsi.reset}` : `    ${index + 1}. ${choice}`));
-      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择${choices.length === 10 ? "（0 选第 10 项）" : ""} · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
+      const offset = Math.floor(selected / pageSize) * pageSize;
+      choices.slice(offset, offset + pageSize).forEach((choice, local) => console.log(offset + local === selected ? `${uiAnsi.cyan}  › ${label(local)}. ${choice}${uiAnsi.reset}` : `    ${label(local)}. ${choice}`));
+      if (choices.length > pageSize) console.log(`\n第 ${Math.floor(selected / pageSize) + 1}/${Math.ceil(choices.length / pageSize)} 页 · ←/→ 或 PageUp/PageDown 翻页`);
+      console.log(`\n${uiAnsi.dim}↑/↓ 选择 · Enter 确定 · 字母直接选择（不区分大小写） · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
     };
     const cleanup = () => {
       process.stdin.removeListener("keypress", onKey);
@@ -5935,10 +6098,18 @@ export async function selectMenu(title: string, information: string, choices: st
     const onKey = (text: string, key: uiReadline.Key) => {
       if (key.ctrl && key.name === "c") { cleanup(); reject(new UiExitRequestedError()); return; }
       if (key.name === "escape") { cleanup(); reject(new UserCancelledError()); return; }
-      if (key.name === "up" || key.name === "k") selected = (selected + choices.length - 1) % choices.length;
-      else if (key.name === "down" || key.name === "j") selected = (selected + 1) % choices.length;
+      if (key.ctrl || key.meta) return;
+      const offset = Math.floor(selected / pageSize) * pageSize;
+      if (key.name === "up") selected = (selected + choices.length - 1) % choices.length;
+      else if (key.name === "down") selected = (selected + 1) % choices.length;
+      else if (["left", "pageup", "right", "pagedown"].includes(key.name ?? "")) {
+        const pages = Math.ceil(choices.length / pageSize);
+        const direction = key.name === "left" || key.name === "pageup" ? -1 : 1;
+        selected = ((Math.floor(selected / pageSize) + direction + pages) % pages) * pageSize;
+      }
       else if (key.name === "return") { cleanup(); resolve(selected); return; }
-      else if (/^[1-9]$/.test(text) && Number(text) <= choices.length) { cleanup(); resolve(Number(text) - 1); return; }
+      else if (/^[a-z]$/i.test(text) && offset + text.toLowerCase().charCodeAt(0) - 97 < choices.length) { cleanup(); resolve(offset + text.toLowerCase().charCodeAt(0) - 97); return; }
+      else if (/^[1-9]$/.test(text) && offset + Number(text) <= choices.length) { cleanup(); resolve(offset + Number(text) - 1); return; }
       else if (text === "0" && choices.length === 10) { cleanup(); resolve(9); return; }
       else return;
       render();
@@ -5988,6 +6159,119 @@ export async function uiValidatedInput(label: string, current: string, validate:
   }
 }
 
+
+
+// ==================== uninstall.ts ====================
+import * as uninstallFs from "node:fs";
+import * as uninstallPath from "node:path";
+
+/** 卸载所需系统操作；测试替换这些依赖，避免操作宿主机服务和防火墙。 */
+export interface UninstallOperations {
+  validate(paths: AppPaths): void;
+  lockUpdates(paths: AppPaths): () => void;
+  unregister(paths: AppPaths): Promise<void>;
+  stop(paths: AppPaths): Promise<void>;
+  lockDaemon(paths: AppPaths): () => void;
+  firewall(paths: AppPaths, config: AppConfig): Promise<FirewallResult>;
+  program(paths: AppPaths): Promise<boolean>;
+}
+
+/**
+ * 校验待清理目录中的每个条目，不跟随符号链接、junction 或特殊文件。
+ * @param directory 已限定在当前安装数据目录内的路径。
+ * @returns 验证通过时无返回值；任何链接均在开始删除前报错。
+ */
+function uninstallAssertTree(directory: string): void {
+  const stat = uninstallFs.lstatSync(directory);
+  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error(`卸载拒绝链接或特殊文件：${directory}`);
+  if (stat.isDirectory()) for (const name of uninstallFs.readdirSync(directory)) uninstallAssertTree(uninstallPath.join(directory, name));
+}
+
+/**
+ * 仅读取卸载所需的防火墙设置，不迁移、重建或修改损坏的节点配置。
+ * @param paths 卸载目标；缺失/损坏配置使用内存默认设置，由底层继续验证规则归属。
+ * @returns 节点为空的配置，只传递经验证的防火墙后端选项。
+ */
+function uninstallFirewallConfig(paths: AppPaths): AppConfig {
+  const config = defaultConfig();
+  try {
+    const saved = JSON.parse(uninstallFs.readFileSync(paths.config, "utf8"));
+    if (saved?.firewall !== undefined) config.firewall = validateFirewallSettings(saved.firewall);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.log(`配置无法完整读取，将按安装归属清理防火墙：${errorMessage(error)}`);
+  }
+  return config;
+}
+
+/**
+ * 提示卸载范围并询问配置保留方式，默认为保留，取消不产生任何写入。
+ * @param paths 确认界面显示的实际目标绝对路径。
+ * @returns true 保留配置及升级备份，false 删除数据，null 取消。
+ */
+export async function confirmUninstall(paths: AppPaths): Promise<boolean | null> {
+  const choice = await selectMenu("卸载 NexusEdge", `目标：${paths.root}\n将停止全部节点、注销本安装自启、清理本工具防火墙规则及内核/日志。\n系统副本会移除程序；便携下载文件与全局 Bun 保留。\n是否保留配置文件（节点、密码、证书及配置备份）？`, ["卸载并保留配置（推荐）", "卸载并删除全部配置及数据", "取消"]);
+  if (choice === 2) return null;
+  if (choice === 1) {
+    const confirmed = await selectMenu("确认删除配置", `将永久删除：${paths.data}\n包含节点凭据、证书、导出链接及备份。`, ["取消", "确认卸载并删除"], 0);
+    if (confirmed !== 1) return null;
+  }
+  return choice === 0;
+}
+
+/**
+ * 在用户已选择保留策略后执行卸载；需要权限时只提升无交互的执行阶段。
+ * @param paths 已确认的安装；keepConfig 为确认结果；source 为提供新版卸载实现的入口；overrides 用于隔离提权测试。
+ * @returns 卸载完成的 Promise。显式目标选项防止提权后转向其他安装；不调用旧版脚本的未知命令。
+ */
+export async function requestUninstall(paths: AppPaths, keepConfig: boolean, source = paths, overrides: Partial<{ admin: typeof isAdministrator; system: typeof isSystemInstallation; elevate: typeof runElevated }> = {}): Promise<void> {
+  const ops = { admin: isAdministrator, system: isSystemInstallation, elevate: runElevated, ...overrides };
+  if (!ops.admin()) {
+    await ops.elevate(source, ["--uninstall", ops.system(paths) ? "--system" : "--local", keepConfig ? "--keep-config" : "--remove-config"]);
+    console.log(`卸载操作完成：${paths.root}${keepConfig ? `\n配置及备份保留在：${paths.data}` : ""}`);
+  } else await uninstallApplication(paths, keepConfig);
+}
+
+/**
+ * 执行卸载：先核对归属和停止状态，清理规则成功后才删除数据。
+ * @param paths 当前安装的标准路径，keepConfig 决定保留配置与 updates 备份。
+ * @param overrides 测试注入的系统操作；生产默认调用真实平台 API。
+ * @returns Windows 专用 Bun 是否正在等待当前面板退出后清理。
+ * 停止或规则清理失败会保留数据。便携根目录、用户源代码和全局 Bun 均不递归删除。
+ */
+export async function uninstallApplication(paths: AppPaths, keepConfig: boolean, overrides: Partial<UninstallOperations> = {}): Promise<boolean> {
+  const ops: UninstallOperations = { validate: assertUninstallTarget, lockUpdates: acquireCoreSelectionLock, unregister: uninstallStartup, stop: stopDaemonGracefully, lockDaemon: acquireDaemonLock, firewall: removeFirewall, program: removeInstalledProgram, ...overrides };
+  if (uninstallPath.resolve(paths.data) !== uninstallPath.join(uninstallPath.resolve(paths.root), ".nexus-edge")) throw new Error("卸载数据路径与安装目录不匹配。");
+  ops.validate(paths);
+  if (uninstallFs.existsSync(paths.data)) uninstallAssertTree(paths.data);
+  const config = uninstallFirewallConfig(paths);
+  const releaseUpdates = ops.lockUpdates(paths);
+  let releaseDaemon: (() => void) | undefined;
+  // 锁文件永久保留：释放后删除会让其他进程锁住旧 inode，破坏 Linux 单实例互斥。
+  const isLock = (name: string): boolean => /^(?:daemon-lock|core-update-lock)\.sqlite(?:-journal|-wal|-shm)?$/.test(name);
+  let pending = false;
+  try {
+    await ops.unregister(paths);
+    await ops.stop(paths);
+    releaseDaemon = ops.lockDaemon(paths);
+    const result = await ops.firewall(paths, config);
+    const hasFirewallRecord = ["firewall-state.json", "firewall-linux-state.json"].some(name => uninstallFs.existsSync(uninstallPath.join(paths.data, name)));
+    if (result.status !== "synced" && !(result.status === "unsupported" && result.backend === "none" && !hasFirewallRecord)) throw new Error(`卸载已停止，数据和防火墙归属记录保留。无法确认规则清理完成：${result.detail}`);
+    if (uninstallFs.existsSync(paths.data)) {
+      uninstallAssertTree(paths.data);
+      const names = uninstallFs.readdirSync(paths.data);
+      // 配置放在最后删除；若先前清理失败，尽可能留下可恢复的节点资料。
+      names.sort((a, b) => Number(a.startsWith("config.json")) - Number(b.startsWith("config.json")));
+      for (const name of names) {
+        if (isLock(name) || (keepConfig && (name === "config.json" || name.startsWith("config.json.") || name === "updates"))) continue;
+        uninstallFs.rmSync(uninstallPath.join(paths.data, name), { recursive: true, force: true });
+      }
+    }
+    // 程序入口也在持锁期间移除，防止清理期间其他入口重启后台或执行内核更新。
+    pending = await ops.program(paths);
+  } finally { try { releaseDaemon?.(); } finally { releaseUpdates(); } }
+  console.log(`卸载完成：后台已停止，自启已注销。${keepConfig ? `\n配置及已有备份保留在：${paths.data}` : "\n配置及运行数据已删除。"}${pending ? "\nWindows 专用 Bun 将在面板退出后自动清理；失败详情写入安装目录 uninstall-error.log。" : ""}`);
+  return pending;
+}
 
 
 // ==================== ipv6-panel.ts ====================
@@ -7270,7 +7554,7 @@ async function panelNetworkSettings(paths: AppPaths): Promise<void> {
   }
 }
 
-export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
+export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "uninstalled"> {
   if (!process.stdin.isTTY) throw new Error("管理面板需要交互式 PowerShell / cmd / Windows Terminal / Linux 终端。");
   for (;;) {
     const config = readConfig(paths);
@@ -7286,8 +7570,8 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "退出面板（保留后台）"]);
-    if (choice === 9) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "退出面板（保留后台）"]);
+    if (choice === 10) return "exit";
     try {
       if (choice === 0) {
         if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
@@ -7301,6 +7585,12 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff"> {
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
       else if (choice === 8) { await panelNetworkSettings(paths); continue; }
+      else if (choice === 9) {
+        const keep = await confirmUninstall(paths);
+        if (keep === null) continue;
+        await requestUninstall(paths, keep);
+        return "uninstalled";
+      }
     } catch (e) {
       if (e instanceof UiExitRequestedError) throw e;
       if (e instanceof UserCancelledError) continue;
@@ -7317,7 +7607,7 @@ import * as mainPath from "node:path";
 
 export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n--uninstall  卸载并询问是否保留配置（默认保留）\n  --keep-config / --remove-config  明确保留 / 删除配置，无交互执行\n  --local / --system  仅当前目录 / 显式系统安装；默认优先已激活系统副本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -7325,6 +7615,15 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   const version = Bun.version.split(".").map(Number);
   if ((version[0] ?? 0) < 1 || (version[0] === 1 && ((version[1] ?? 0) < 4 || (version[1] === 4 && (version[2] ?? 0) < 3)))) throw new Error("请使用 Bun 1.4.3 或更新版本。");
   const paths = createPaths(entry);
+  if (args[0] === "--uninstall") {
+    const options = args.slice(1);
+    if (options.some(option => !["--keep-config", "--remove-config", "--local", "--system"].includes(option)) || new Set(options).size !== options.length || (options.includes("--keep-config") && options.includes("--remove-config")) || (options.includes("--local") && options.includes("--system"))) throw new Error("卸载参数无效。使用 --uninstall [--keep-config | --remove-config] [--local | --system]。");
+    const target = resolveUninstallTarget(paths, options.includes("--local") ? "local" : options.includes("--system") ? "system" : "default");
+    const keep = options.includes("--keep-config") ? true : options.includes("--remove-config") ? false : await confirmUninstall(target);
+    if (keep !== null) await requestUninstall(target, keep, paths);
+    else console.log("已取消卸载。");
+    return 0;
+  }
   if (args[0] === "--host-ipv6") return runHostIpv6Helper(args.slice(1));
   if (args[0] === "--firewall-request") {
     if (args.length !== 2) throw new Error("防火墙辅助程序需要有效的单次请求 ID。");
@@ -7378,7 +7677,7 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
     if (!target) throw new Error("无法定位系统副本。");
     current = createPaths(target.entry, target.runtime);
     await runElevated(current, []);
-  } else console.log("已退出面板，后台运行状态保持不变。");
+  } else if (result !== "uninstalled") console.log("已退出面板，后台运行状态保持不变。");
   return 0;
 }
 

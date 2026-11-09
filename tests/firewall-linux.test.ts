@@ -110,6 +110,51 @@ class MockLinuxFirewall {
   ownUfw(r: FirewallRule, id = scope) { this.ufwRules.push({ rule: r, comment: linux.ufwComment(id, r), action: "ALLOW" }); }
 }
 
+// 此组只调用命令算法，不访问 POSIX 文件权限，因此 Windows 也能执行；所有命令均为替身。
+bunDescribe("Linux uninstall empty firewall plans (command simulation)", () => {
+  /** 构造空计划会话；可选归属记录用于判断缺工具时能否安全确认清理。 */
+  function session(f: MockLinuxFirewall, claimed = false): Parameters<typeof linux.iptablesSync>[0] {
+    return { plan: plan([]), runner: f.run, backend: "iptables", changed: false, warnings: [], context: context(), journal: { schema: 1, scope, firewalld: [], ...(claimed ? { backend: "iptables" as const } : {}) } };
+  }
+  test("没有工具也没有归属记录时无需创建防火墙即可卸载", async () => {
+    const f = new MockLinuxFirewall(); f.manager = "none";
+    expect((await linux.iptablesSync(session(f), true)).status).toBe("synced");
+    expect(f.mutations).toHaveLength(0);
+  });
+  test("默认 ACCEPT 无本安装规则，原生 nft 冲突不会阻止空计划清理", async () => {
+    const f = new MockLinuxFirewall(); f.manager = "iptables";
+    f.v4[0]![2] = "ACCEPT"; f.v6[0]![2] = "ACCEPT";
+    f.nftChains = [{ chain: { family: "inet", hook: "input", name: "unrelated", policy: "drop" } }];
+    expect((await linux.iptablesSync(session(f), true)).status).toBe("synced");
+    expect(f.mutations).toHaveLength(0);
+    expect(f.calls.some(call => call.executable === "nft")).toBe(false);
+  });
+  test("有归属记录但工具缺失时阻止删除，不能假装没有规则", async () => {
+    const f = new MockLinuxFirewall(); f.manager = "none";
+    await expect(linux.iptablesSync(session(f, true), true)).rejects.toThrow("曾使用 iptables");
+    expect(f.mutations).toHaveLength(0);
+  });
+  test("默认 ACCEPT 下仍会清理带完整归属标记的孤立链", async () => {
+    const f = new MockLinuxFirewall(); f.manager = "iptables";
+    f.v4[0]![2] = "ACCEPT"; f.v6[0]![2] = "ACCEPT";
+    const chain = linux.chain(scope);
+    f.v4.push(["-N", chain], ["-A", chain, ...linux.iptablesOwner(scope)]);
+    expect((await linux.iptablesSync(session(f, true), true)).status).toBe("synced");
+    expect(f.v4.some(line => line.includes(chain))).toBe(false);
+    expect(f.v4[0]).toEqual(["-P", "INPUT", "ACCEPT"]);
+  });
+  test("停用 UFW 时保留持久规则并阻止卸载清理", async () => {
+    const f = new MockLinuxFirewall(), c = context();
+    f.ownUfw(rule(443));
+    fs.writeFileSync(c.stateFile, JSON.stringify({ schema: 1, scope, backend: "ufw", firewalld: [] }));
+    f.intercept = (exe, args) => exe === "ufw" && args[0] === "status" ? ok("Status: inactive") : undefined;
+    expect((await applyLinuxFirewall(plan([]), { ...auto, linuxBackend: "ufw" }, f.run, c)).status).toBe("inactive");
+    expect(f.ufwRules).toHaveLength(1);
+    expect(fs.existsSync(c.stateFile)).toBe(true);
+    expect(f.mutations).toHaveLength(0);
+  });
+});
+
 describe("Linux backend detection and ownership boundaries", () => {
   test("inspection is read-only; explicit backend conflicts and ambiguous manager states do not fall through", async () => {
     const f = new MockLinuxFirewall(), c = context(), p = plan([rule(443)]);

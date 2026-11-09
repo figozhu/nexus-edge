@@ -2,16 +2,17 @@ import * as mainUrl from "node:url";
 import * as mainPath from "node:path";
 import { APP_VERSION, assertSupportedPlatform, createPaths, atomicWrite, errorMessage, type AppPaths } from "./core.ts";
 import { runDaemonWorker, runCoreHost, stopDaemonGracefully } from "./daemon.ts";
-import { isAdministrator, discoverSystemInstallation, isSystemInstallation, runElevated, installedScriptVersion, updateSystemEntry } from "./platform.ts";
+import { isAdministrator, discoverSystemInstallation, isSystemInstallation, runElevated, installedScriptVersion, updateSystemEntry, resolveUninstallTarget } from "./platform.ts";
 import { migrateSystemInstallation } from "./migration.ts";
 import { UserCancelledError, UiExitRequestedError, selectMenu } from "./ui.ts";
 import { runPanel } from "./panel.ts";
 import { runFirewallRequest } from "./firewall-control.ts";
 import { runHostIpv6Helper } from "./ipv6.ts";
+import { confirmUninstall, requestUninstall } from "./uninstall.ts";
 
 export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fileURLToPath(import.meta.url)): Promise<number> {
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
+    console.log(`NexusEdge ${APP_VERSION}\n\n运行：bun nexus-edge.ts\n多协议节点管理：VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS / SOCKS5 / Naive。\n隧道按节点可选：关闭 / 临时 / 固定。首次进入面板后添加节点。\n内核管理：检查官方更新、按需升级、预发布 / 指定版本、回退。\n防火墙：默认自动放行节点所需 TCP / UDP 监听端口，也可手动管理。\nIPv6：核心出站默认禁用；可在“IPv6 / 防火墙设置”分别控制核心与本机接口。\n支持 Windows x64、Linux x64 / arm64，Bun >= 1.4.3。\n\n--help / --version  查看说明或版本\n--uninstall  卸载并询问是否保留配置（默认保留）\n  --keep-config / --remove-config  明确保留 / 删除配置，无交互执行\n  --local / --system  仅当前目录 / 显式系统安装；默认优先已激活系统副本\n其他 --worker / --core-host / --stop-worker / --install-system / --update-system / --firewall-request / --host-ipv6 参数由程序内部使用。`);
     return 0;
   }
   if (args[0] === "--version") { console.log(APP_VERSION); return 0; }
@@ -19,6 +20,15 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
   const version = Bun.version.split(".").map(Number);
   if ((version[0] ?? 0) < 1 || (version[0] === 1 && ((version[1] ?? 0) < 4 || (version[1] === 4 && (version[2] ?? 0) < 3)))) throw new Error("请使用 Bun 1.4.3 或更新版本。");
   const paths = createPaths(entry);
+  if (args[0] === "--uninstall") {
+    const options = args.slice(1);
+    if (options.some(option => !["--keep-config", "--remove-config", "--local", "--system"].includes(option)) || new Set(options).size !== options.length || (options.includes("--keep-config") && options.includes("--remove-config")) || (options.includes("--local") && options.includes("--system"))) throw new Error("卸载参数无效。使用 --uninstall [--keep-config | --remove-config] [--local | --system]。");
+    const target = resolveUninstallTarget(paths, options.includes("--local") ? "local" : options.includes("--system") ? "system" : "default");
+    const keep = options.includes("--keep-config") ? true : options.includes("--remove-config") ? false : await confirmUninstall(target);
+    if (keep !== null) await requestUninstall(target, keep, paths);
+    else console.log("已取消卸载。");
+    return 0;
+  }
   if (args[0] === "--host-ipv6") return runHostIpv6Helper(args.slice(1));
   if (args[0] === "--firewall-request") {
     if (args.length !== 2) throw new Error("防火墙辅助程序需要有效的单次请求 ID。");
@@ -72,7 +82,7 @@ export async function nexusMain(args = process.argv.slice(2), entry = mainUrl.fi
     if (!target) throw new Error("无法定位系统副本。");
     current = createPaths(target.entry, target.runtime);
     await runElevated(current, []);
-  } else console.log("已退出面板，后台运行状态保持不变。");
+  } else if (result !== "uninstalled") console.log("已退出面板，后台运行状态保持不变。");
   return 0;
 }
 

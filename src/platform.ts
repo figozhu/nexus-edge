@@ -701,12 +701,150 @@ export async function stopManaged(paths: AppPaths): Promise<void> {
 
 export async function restartManaged(paths: AppPaths): Promise<void> { await stopManaged(paths); await startManaged(paths); }
 
+/**
+ * 验证卸载目标的目录与系统安装标记；不依赖节点配置是否完整。
+ * @param paths 当前入口对应的路径。系统路径要求管理员及受保护的真实安装。
+ * @returns 校验通过时无返回值；拒绝链接、伪造标记和非受保护的系统目录。
+ */
+export function assertUninstallTarget(paths: AppPaths): void {
+  platformAssertNoLinkAncestors(paths.data);
+  if (platformSamePath(paths.root, platformSystemPaths().root) && !platformIsSystemPath(paths)) throw new Error("系统目录必须使用其专用入口和运行时卸载，请重新运行 --uninstall 解析正确目标。");
+  if (!platformIsSystemPath(paths)) return;
+  platformRequireAdministrator();
+  const marker = JSON.parse(platformFs.readFileSync(platformPath.join(paths.root, platformInstallMarker), "utf8"));
+  if (!platformInstallMarkerMatches(marker, paths) || !platformVerifyPublicInstall(paths)) throw new Error("系统安装归属或目录权限不匹配，未执行卸载。");
+}
+
+/**
+ * 解析卸载目标，兼容使用全局 Bun 打开系统入口以及新版便携脚本卸载旧系统副本。
+ * @param source 当前执行脚本；scope 为自动发现、仅当前目录或显式系统安装。
+ * @returns 使用安装标记中固定运行时的路径。显式系统目标不存在时抛错，不回退删除便携数据。
+ */
+export function resolveUninstallTarget(source: AppPaths, scope: "default" | "local" | "system" = "default"): AppPaths {
+  const system = platformSystemPaths();
+  if (platformSamePath(source.root, system.root) || scope === "system") {
+    const marker = JSON.parse(platformFs.readFileSync(platformPath.join(system.root, platformInstallMarker), "utf8"));
+    if (!platformInstallMarkerMatches(marker, system) || !platformVerifyPublicInstall(system)) throw new Error("系统卸载目标的标记或保护权限无效。");
+    return system;
+  }
+  const installed = scope === "default" ? discoverSystemInstallation() : null;
+  return installed ? createPaths(installed.entry, installed.runtime) : source;
+}
+
+/**
+ * 为已核对归属的 Windows 任务构建关闭或注销操作；不存在的任务视为已处理。
+ * @param spec 由当前安装生成的任务定义；remove 为 true 时要求任务已停止。
+ * @returns 带归属检查的 PowerShell 程序，不强杀进程或删除同名外部任务。
+ */
+function platformBuildUninstallTaskScript(spec: PlatformTaskSpec, remove: boolean): string {
+  return platformPowerShellPayload(spec) + platformGetTaskCode + platformAssertTaskOwnerCode + (remove ? `
+if ($t) {
+  if ([string]$t.State -in @('Running', 'Queued', '4', '2')) { throw '计划任务仍在运行，未注销。' }
+  Unregister-ScheduledTask -TaskName $p.name -TaskPath '\\' -Confirm:$false
+}
+` : `
+if ($t) { Disable-ScheduledTask -TaskName $p.name -TaskPath '\\' | Out-Null }
+`);
+}
+
+/**
+ * 先关闭自动触发，再正常停止并注销本安装的托管定义。
+ * @param paths 卸载目标；便携 Linux 没有系统服务，不触碰其他安装。
+ * @returns 完成的 Promise；归属冲突、停止失败或注销失败会抛错，数据由调用方保留。
+ */
+export async function uninstallStartup(paths: AppPaths): Promise<void> {
+  assertUninstallTarget(paths);
+  if (process.platform === "win32") {
+    const spec = platformTaskSpec(paths, platformIsSystemPath(paths) ? "system" : "user");
+    const task = await platformReadTask(spec);
+    if (!task) return;
+    if (!platformTaskOwnership(spec, task)) throw new Error("同名计划任务不属于此安装，未执行卸载。");
+    await platformPowerShell(platformBuildUninstallTaskScript(spec, false));
+    // 通过认证 IPC 正常停止，避免 Stop-ScheduledTask 直接终止后遗留核心。
+    platformRequireSuccess(await platformCommand(paths.runtime, [paths.entry, "--stop-worker"], { cwd: paths.root, timeoutMs: 25000 }), "卸载前停止后台");
+    const deadline = Date.now() + 15000;
+    while (true) {
+      const latest = await platformReadTask(spec);
+      if (!latest || !["Running", "Queued", "4", "2"].includes(latest.state)) break;
+      if (Date.now() >= deadline) throw new Error("计划任务停止超时，已保留程序和数据。请检查后台日志后重试卸载。");
+      await platformDelay(250);
+    }
+    await platformPowerShell(platformBuildUninstallTaskScript(spec, true));
+    if (await platformReadTask(spec)) throw new Error("计划任务注销后仍然存在，已保留数据。");
+  } else if (process.platform === "linux" && platformIsSystemPath(paths) && platformFs.existsSync(platformUnitFile)) {
+    platformRequireLinuxManager(paths);
+    await platformLinuxStatus(paths);
+    await platformSystemctl(["disable", platformUnitName]);
+    await platformSystemctl(["stop", platformUnitName]);
+    const state = await platformLinuxStatus(paths);
+    if (state.running) throw new Error("systemd 服务仍在运行，已保留 unit 和数据。");
+    platformAssertUnitOwner(paths);
+    platformFs.unlinkSync(platformUnitFile);
+    await platformSystemctl(["daemon-reload"]);
+  }
+}
+
+/**
+ * 构建 Windows 退出后的专用 Bun 清理程序；只删除固定文件，绝不递归删除安装根目录。
+ * @param paths 已验证的系统安装路径。文件占用时最多重试 60 秒，失败写入根目录日志。
+ * @returns PowerShell 程序；所有路径通过数据载荷传入，并在删除前拒绝重解析点。
+ */
+function platformBuildRuntimeCleanup(paths: AppPaths): string {
+  return platformPowerShellPayload({ root: paths.root, runtime: paths.runtime }) + `
+$root = [IO.Path]::GetFullPath($p.root)
+$runtime = [IO.Path]::GetFullPath($p.runtime)
+$expected = [IO.Path]::Combine($root, 'runtime', 'bun.exe')
+if (-not $runtime.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { throw '运行时清理路径不匹配。' }
+for ($attempt = 0; $attempt -lt 120; $attempt++) {
+  try {
+    foreach ($itemPath in @($root, [IO.Path]::GetDirectoryName($runtime), $runtime)) {
+      if (Test-Path -LiteralPath $itemPath) {
+        if (((Get-Item -LiteralPath $itemPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw '清理路径已变为重解析点。' }
+      }
+    }
+    # 出现新的安装标记说明期间已重新安装，必须保留新运行时。
+    if (Test-Path -LiteralPath ([IO.Path]::Combine($root, 'installation.json'))) { exit 0 }
+    if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Force -ErrorAction Stop }
+    foreach ($directory in @([IO.Path]::GetDirectoryName($runtime), $root)) {
+      if ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { [IO.Directory]::Delete($directory, $false) }
+    }
+    exit 0
+  } catch { $failure = $_.Exception.Message; Start-Sleep -Milliseconds 500 }
+}
+[IO.File]::WriteAllText([IO.Path]::Combine($root, 'uninstall-error.log'), '运行时清理失败，请关闭其他 NexusEdge 面板后手动删除 runtime/bun.exe：' + $failure)
+exit 1
+`;
+}
+
+/**
+ * 清理系统安装的入口、标记和专用运行时；便携下载文件及全局 Bun 保留。
+ * @param paths 已完成服务、规则和数据清理的目标。
+ * @returns Windows 正占用的 Bun 是否已交给隐藏辅助进程在退出后清理。
+ */
+export async function removeInstalledProgram(paths: AppPaths): Promise<boolean> {
+  if (!platformIsSystemPath(paths)) return false;
+  assertUninstallTarget(paths);
+  // 先删除入口，最后移除标记；失败时下一次仍可诊断，而不会误删其他目录。
+  platformFs.unlinkSync(paths.entry);
+  platformFs.unlinkSync(platformPath.join(paths.root, platformInstallMarker));
+  if (process.platform === "win32") {
+    const child = platformCp.spawn(platformPowerShellExe(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", platformEncodePowerShell(platformPowerShellProgram(platformBuildRuntimeCleanup(paths)))], { cwd: platformPath.dirname(paths.root), detached: true, windowsHide: true, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+    return true;
+  }
+  platformFs.unlinkSync(paths.runtime);
+  for (const directory of [platformPath.dirname(paths.runtime), paths.root]) if (platformFs.readdirSync(directory).length === 0) platformFs.rmdirSync(directory);
+  return false;
+}
+
 /** 测试用纯构建器和校验辅助；真实计划任务验收仅在显式启用的 Windows 集成测试中执行。 */
 export const platformInternals = {
   quoteWindowsArg: platformQuoteWindowsArg, windowsArguments: platformWindowsArguments,
   encodePowerShell: platformEncodePowerShell, powerShellPayload: platformPowerShellPayload, powerShellProgram: platformPowerShellProgram,
   taskSpec: platformTaskSpec, buildTaskScript: platformBuildTaskScript, assessTask: platformAssessTask,
   buildElevationScript: platformBuildElevationScript,
+  buildUninstallTaskScript: platformBuildUninstallTaskScript, buildRuntimeCleanup: platformBuildRuntimeCleanup,
   systemdUnit: platformSystemdUnit, quoteSystemd: platformQuoteSystemd,
   systemdWorkingDirectory: platformSystemdWorkingDirectory,
   copyRegularTree: platformCopyRegularTree, linuxProtected: platformLinuxProtected,

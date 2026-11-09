@@ -195,7 +195,7 @@ class Terminal:
 
 
 def run_cycles(terminal: Terminal) -> None:
-    actions = [b"\r", b"j\r", b"3"]
+    actions = [b"\r", b"\x1b[B\r", b"c"]
     for round_number in range(1, 4):
         terminal.expect(f"循环菜单 {round_number}")
         terminal.send(actions[round_number - 1])
@@ -259,16 +259,37 @@ def run_escape(terminal: Terminal) -> None:
     assert terminal.event("after-escape")["text"] == "保留原协议"
 
 
+def run_letters(terminal: Terminal) -> None:
+    """验证第十/十一项字母不再导航、大小写、长菜单翻页及方向键跨页选择。"""
+    for count, keys, selected in [(11, b"j", 9), (11, b"K", 10), (11, b"A", 0),
+                                   (33, b"\x1b[Cg", 32), (33, b"\x1b[A\r", 32)]:
+        terminal.expect(f"字母菜单 {count}")
+        terminal.send(keys)
+        assert terminal.event("letter-selected")["selected"] == selected
+
+
+def run_uninstall(terminal: Terminal) -> None:
+    """只测试保留/删除/取消确认，不调用实际卸载，不产生配置或系统副作用。"""
+    for first, second, expected in [(b"\r", None, True), (b"c", None, None),
+                                     (b"b", b"\r", None), (b"b", b"b", False)]:
+        terminal.expect("是否保留配置文件")
+        terminal.send(first)
+        if second is not None:
+            terminal.expect("将永久删除")
+            terminal.send(second)
+        assert terminal.event("uninstall-choice")["keep"] is expected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bun", default=os.environ.get("NEXUS_EDGE_BUN", "bun"), help="Bun executable (>= 1.4.3)")
-    parser.add_argument("--scenario", choices=["all", "cycles", "secret", "ctrlc", "escape"], default="all")
+    parser.add_argument("--scenario", choices=["all", "cycles", "secret", "ctrlc", "escape", "letters", "uninstall"], default="all")
     args = parser.parse_args()
     bun = shutil.which(args.bun)
     if not bun:
         parser.error(f"Bun executable not found: {args.bun}")
     bun = str(Path(bun).resolve())
-    scenarios = {"cycles": run_cycles, "secret": run_secret, "ctrlc": run_ctrlc, "escape": run_escape}
+    scenarios = {"cycles": run_cycles, "secret": run_secret, "ctrlc": run_ctrlc, "escape": run_escape, "letters": run_letters, "uninstall": run_uninstall}
     failures = 0
     for name, action in scenarios.items():
         if args.scenario not in ("all", name):

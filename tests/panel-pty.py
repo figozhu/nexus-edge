@@ -36,11 +36,11 @@ def screen(t, title):
 
 
 def pick(t, content, label):
-    """从已读菜单按前缀寻找唯一选项并发送对应数字；歧义或缺项直接失败。"""
-    options = re.findall(r"(?:^|[\r\n])\s*(?:›\s*)?(\d+)\.\s*([^\r\n]+)", content)
+    """从已读菜单按前缀寻找唯一选项并发送对应字母；歧义或缺项直接失败。"""
+    options = re.findall(r"(?:^|[\r\n])\s*(?:›\s*)?([a-z])\.\s*([^\r\n]+)", content)
     matches = [(number, text) for number, text in options if text.startswith(label)]
     assert len(matches) == 1, (label, options)
-    t.send("0" if matches[0][0] == "10" else matches[0][0])
+    t.send(matches[0][0])
 
 
 def choose(t, title, label):

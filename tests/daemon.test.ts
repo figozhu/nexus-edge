@@ -17,6 +17,7 @@ import {
   startDetachedDaemon, stopDaemonGracefully,
 } from "../src/daemon.ts";
 import { certificatePem, keyPem } from "./fixtures/tls.ts";
+import { uninstallApplication } from "../src/uninstall.ts";
 
 const ENTRY = join(import.meta.dir, "fixtures", "daemon-entry.ts");
 interface MockEvent { role: string; kind: string; pid: number; args: string[]; at: number }
@@ -96,6 +97,28 @@ function startWorker(env: Environment): ChildProcess {
   env.workers.push(child);
   return child;
 }
+
+/** 卸载真实测试 worker/core-host/回环核心；仅替换系统自启和防火墙，验证停止先于文件清理。 */
+test("uninstall waits for the worker and owned core before deleting runtime data", async () => {
+  const env = await environment({ protocol: "shadowsocks" });
+  const child = startWorker(env);
+  await until(() => getDaemonStatus(env.paths), status => status?.phase === "ready");
+  const corePid = events(env).find(event => event.kind === "start" && event.role === "singBox")!.pid;
+  await uninstallApplication(env.paths, true, {
+    validate: () => {}, unregister: async () => {},
+    firewall: async () => {
+      expect(await getDaemonStatus(env.paths)).toBeNull();
+      expect(alive(corePid)).toBe(false);
+      return { backend: "windows", status: "synced", changed: false, detail: "测试规则为空", warnings: [], rules: [] };
+    },
+    program: async () => false,
+  });
+  await until(() => child.exitCode, code => code !== null);
+  expect(child.exitCode).toBe(0);
+  expect(existsSync(env.paths.config)).toBe(true);
+  expect(existsSync(env.paths.runtimeState)).toBe(false);
+  expect(existsSync(env.paths.log)).toBe(false);
+}, 15000);
 
 test("firewall diagnostics use the installation scope and remain separate from local listener readiness", async () => {
   const env = await environment({ protocol: "shadowsocks" });

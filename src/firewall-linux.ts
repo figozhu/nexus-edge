@@ -449,12 +449,20 @@ async function linuxIptablesCheckNft(s: LinuxFirewallSession): Promise<void> {
   });
   if (conflicts.length) linuxFirewallFail("unsupported", `检测到原生 nftables input 链（${conflicts.join("、")}）。独立 iptables ACCEPT 无法保证绕过其 DROP 策略，请在现有 nftables 管理配置中放行这些端口。`);
 }
+/**
+ * 对当前安装的有限 iptables 计划执行检查或同步；空计划用于停止/卸载时清理。
+ * @param s 已完成后端与归属记录验证的会话；apply 为 false 时只查询。
+ * @returns 同步结果；有历史归属但工具缺失时拒绝假定规则已消失。
+ */
 async function linuxIptablesSync(s: LinuxFirewallSession, apply: boolean): Promise<FirewallResult> {
-  await linuxIptablesCheckNft(s);
+  // 空计划只移除归属明确的规则，不需要证明新增 ACCEPT 能绕过其他 nftables 策略。
+  // 仍逐条校验自己的链和引用，绝不修改原生 nftables 或其他安装的规则。
+  if (s.plan.rules.length) await linuxIptablesCheckNft(s);
   let snapshots = await Promise.all(([4, 6] as const).map(family => linuxIptablesSnapshot(s, family)));
   for (const rule of s.plan.rules) if (!snapshots.find(snapshot => snapshot.family === rule.family)?.available) linuxFirewallFail("unsupported", `当前系统缺少 ${rule.family === 4 ? "iptables" : "ip6tables"}，无法自动处理所需的 IPv${rule.family} 端口。`);
-  if (!snapshots.some(snapshot => snapshot.available)) return linuxFirewallResult(s, "inactive", "未检测到正在管理本机端口的 UFW、firewalld 或可用的 iptables；未创建防火墙策略。");
-  if (!snapshots.some(snapshot => snapshot.active)) return linuxFirewallResult(s, "inactive", "iptables INPUT 当前未设置过滤规则且默认允许入站，无需额外放行；工具不会替您启用防火墙。");
+  if (!s.plan.rules.length && s.journal?.backend === "iptables" && snapshots.some(snapshot => !snapshot.available)) linuxFirewallFail("unsupported", "本安装曾使用 iptables，但当前无法查询全部地址族的规则。请恢复 iptables / ip6tables 后重试清理，归属记录已保留。");
+  if (!snapshots.some(snapshot => snapshot.available)) return linuxFirewallResult(s, s.plan.rules.length ? "inactive" : "synced", "未检测到可用的 iptables，也没有本安装待清理的规则归属记录；未创建防火墙策略。");
+  if (s.plan.rules.length && !snapshots.some(snapshot => snapshot.active)) return linuxFirewallResult(s, "inactive", "iptables INPUT 当前未设置过滤规则且默认允许入站，无需额外放行；工具不会替您启用防火墙。");
   s.warnings.push("iptables 规则仅在当前内核运行期生效；本工具以管理员权限启动时会重新同步。不会保存或覆盖系统的整个规则集。");
   s.warnings.push("此状态验证本机 filter/INPUT 规则；其他内核过滤路径、路由和云安全组仍可能影响连通性。");
   const changed = snapshots.some(snapshot => {
@@ -585,4 +593,4 @@ export async function transferLinuxUfwOwnership(sourcePlan: FirewallPlan, target
   finally { release?.(); }
 }
 
-export const linuxFirewallInternals = { key: linuxFirewallKey, ufwComment: linuxUfwComment, ufwSpec: linuxUfwSpec, ufwParseStatus: linuxUfwParseStatus, richRule: linuxFirewalldRichRule, chain: linuxIptablesChain, iptablesRule: linuxIptablesRule, iptablesOwner: linuxIptablesOwner, iptablesJump: linuxIptablesJump, words: linuxFirewallWords };
+export const linuxFirewallInternals = { key: linuxFirewallKey, ufwComment: linuxUfwComment, ufwSpec: linuxUfwSpec, ufwParseStatus: linuxUfwParseStatus, richRule: linuxFirewalldRichRule, chain: linuxIptablesChain, iptablesRule: linuxIptablesRule, iptablesOwner: linuxIptablesOwner, iptablesJump: linuxIptablesJump, words: linuxFirewallWords, iptablesSync: linuxIptablesSync };

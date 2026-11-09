@@ -32,8 +32,9 @@ TOKEN = "FIXED_TOKEN_no_echo_0123456789+/="
 
 
 def choose(t, prompt, value=1):
+    """等待菜单并按一基位置发送字母快捷键，使既有业务场景覆盖新的按键路径。"""
     t.expect(prompt)
-    t.send(str(value))
+    t.send(chr(96 + value))
 
 
 def enter(t, prompt, value):

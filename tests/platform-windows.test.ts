@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createPaths } from "../src/core.ts";
-import { enableStartup, disableStartup, getStartupStatus, startManaged, isAdministrator, platformPowerShell, platformInternals as platform } from "../src/platform.ts";
+import { enableStartup, disableStartup, getStartupStatus, startManaged, uninstallStartup, isAdministrator, platformPowerShell, platformInternals as platform } from "../src/platform.ts";
 
 /**
  * 等待测试任务写入完成标记；只读取本用例创建的临时文件。
@@ -51,6 +51,9 @@ describe.skipIf(process.platform !== "win32" || process.env.NEXUS_PLATFORM_WINDO
       expect(await getStartupStatus(paths)).toMatchObject({ mode: "windows-user", enabled: false });
       await enableStartup(paths, "user");
       expect(await getStartupStatus(paths)).toMatchObject({ mode: "windows-user", enabled: true });
+      await uninstallStartup(paths);
+      expect(await getStartupStatus(paths)).toMatchObject({ mode: "none", enabled: false, running: false });
+      await uninstallStartup(paths);
     } finally {
       await removeTask(spec);
       fs.rmSync(root, { recursive: true, force: true });

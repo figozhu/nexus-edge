@@ -7,16 +7,31 @@ export class UiExitRequestedError extends Error { constructor() { super("已退�
 const uiAnsi = { reset: "\x1b[0m", cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m", dim: "\x1b[2m", bold: "\x1b[1m" };
 let uiKeyEventsInitialized = false;
 
-/** Raw mode is scoped to one menu. Every exit path restores the cursor and stdin. */
+/**
+ * 显示菜单并返回选中项的零基索引；initial 为默认项。
+ * TTY 每页最多 26 项，字母不区分大小写，方向键跨页移动；非 TTY 输入字母序号后回车。
+ * 数字 1–9 保留为当前页前九项的兼容快捷键；j/k 现在分别选择第十/十一项。
+ * 所有退出路径均恢复 raw mode、光标和监听器；空菜单直接报错。
+ */
 export async function selectMenu(title: string, information: string, choices: string[], initial = 0): Promise<number> {
+  if (!choices.length) throw new Error("菜单至少需要一个选项。");
+  const pageSize = 26;
+  const label = (index: number): string => {
+    // 非 TTY 的完整列表使用 a…z、aa…az 等序号，输入整行后才解析，不会误选 a。
+    let result = "";
+    for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26)) result = String.fromCharCode(97 + (value - 1) % 26) + result;
+    return result;
+  };
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.log(`\n${title}\n${information}`);
-    choices.forEach((item, index) => console.log(`${index + 1}. ${item}`));
+    choices.forEach((item, index) => console.log(`${label(index)}. ${item}`));
     for (;;) {
-      const answer = await promptInput("输入选项编号", String(initial + 1));
+      const answer = (await promptInput("输入选项字母", label(initial))).toLowerCase();
+      const letterIndex = choices.findIndex((_, index) => label(index) === answer);
+      if (letterIndex >= 0) return letterIndex;
       const n = Number(answer);
       if (Number.isInteger(n) && n >= 1 && n <= choices.length) return n - 1;
-      console.log("请输入列表中的编号。");
+      console.log("请输入列表中的字母。");
     }
   }
   if (!uiKeyEventsInitialized) { uiReadline.emitKeypressEvents(process.stdin); uiKeyEventsInitialized = true; }
@@ -28,8 +43,10 @@ export async function selectMenu(title: string, information: string, choices: st
       console.log(`${uiAnsi.bold}${uiAnsi.cyan}NexusEdge ${APP_VERSION}${uiAnsi.reset}\n`);
       if (information) console.log(information + "\n");
       console.log(`${uiAnsi.bold}${title}${uiAnsi.reset}\n`);
-      choices.forEach((choice, index) => console.log(index === selected ? `${uiAnsi.cyan}  › ${index + 1}. ${choice}${uiAnsi.reset}` : `    ${index + 1}. ${choice}`));
-      console.log(`\n${uiAnsi.dim}↑/↓ 或 j/k 选择 · Enter 确定 · 数字直接选择${choices.length === 10 ? "（0 选第 10 项）" : ""} · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
+      const offset = Math.floor(selected / pageSize) * pageSize;
+      choices.slice(offset, offset + pageSize).forEach((choice, local) => console.log(offset + local === selected ? `${uiAnsi.cyan}  › ${label(local)}. ${choice}${uiAnsi.reset}` : `    ${label(local)}. ${choice}`));
+      if (choices.length > pageSize) console.log(`\n第 ${Math.floor(selected / pageSize) + 1}/${Math.ceil(choices.length / pageSize)} 页 · ←/→ 或 PageUp/PageDown 翻页`);
+      console.log(`\n${uiAnsi.dim}↑/↓ 选择 · Enter 确定 · 字母直接选择（不区分大小写） · Esc 返回 · Ctrl+C 退出面板${uiAnsi.reset}`);
     };
     const cleanup = () => {
       process.stdin.removeListener("keypress", onKey);
@@ -42,10 +59,18 @@ export async function selectMenu(title: string, information: string, choices: st
     const onKey = (text: string, key: uiReadline.Key) => {
       if (key.ctrl && key.name === "c") { cleanup(); reject(new UiExitRequestedError()); return; }
       if (key.name === "escape") { cleanup(); reject(new UserCancelledError()); return; }
-      if (key.name === "up" || key.name === "k") selected = (selected + choices.length - 1) % choices.length;
-      else if (key.name === "down" || key.name === "j") selected = (selected + 1) % choices.length;
+      if (key.ctrl || key.meta) return;
+      const offset = Math.floor(selected / pageSize) * pageSize;
+      if (key.name === "up") selected = (selected + choices.length - 1) % choices.length;
+      else if (key.name === "down") selected = (selected + 1) % choices.length;
+      else if (["left", "pageup", "right", "pagedown"].includes(key.name ?? "")) {
+        const pages = Math.ceil(choices.length / pageSize);
+        const direction = key.name === "left" || key.name === "pageup" ? -1 : 1;
+        selected = ((Math.floor(selected / pageSize) + direction + pages) % pages) * pageSize;
+      }
       else if (key.name === "return") { cleanup(); resolve(selected); return; }
-      else if (/^[1-9]$/.test(text) && Number(text) <= choices.length) { cleanup(); resolve(Number(text) - 1); return; }
+      else if (/^[a-z]$/i.test(text) && offset + text.toLowerCase().charCodeAt(0) - 97 < choices.length) { cleanup(); resolve(offset + text.toLowerCase().charCodeAt(0) - 97); return; }
+      else if (/^[1-9]$/.test(text) && offset + Number(text) <= choices.length) { cleanup(); resolve(offset + Number(text) - 1); return; }
       else if (text === "0" && choices.length === 10) { cleanup(); resolve(9); return; }
       else return;
       render();

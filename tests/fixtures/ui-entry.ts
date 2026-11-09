@@ -1,6 +1,8 @@
 /** PTY-only fixture. It calls no panel, network, daemon, or startup entry points. */
 import * as uiFixtureCrypto from "node:crypto";
 import { selectMenu, promptInput, UserCancelledError, UiExitRequestedError } from "../../src/ui.ts";
+import { confirmUninstall } from "../../src/uninstall.ts";
+import { createPaths } from "../../src/core.ts";
 
 globalThis.fetch = (async () => { throw new Error("The UI PTY fixture must never access the network."); }) as unknown as typeof fetch;
 
@@ -23,6 +25,18 @@ async function uiFixtureMain(): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("This fixture must run under a real PTY.");
   uiFixtureTrace("start", { scenario, stdinTTY: process.stdin.isTTY, stdoutTTY: process.stdout.isTTY });
   switch (scenario) {
+    case "letters": {
+      for (const count of [11, 11, 11, 33, 33]) {
+        const selected = await selectMenu(`字母菜单 ${count}`, "单键直达与分页测试", Array.from({ length: count }, (_, index) => `选项 ${index + 1}`));
+        uiFixtureTrace("letter-selected", { count, selected });
+      }
+      break;
+    }
+    case "uninstall": {
+      const paths = createPaths("nexus-edge.ts");
+      for (let round = 0; round < 4; round++) uiFixtureTrace("uninstall-choice", { keep: await confirmUninstall(paths) });
+      break;
+    }
     case "cycles": {
       for (let round = 1; round <= 3; round++) {
         const selected = await selectMenu(`循环菜单 ${round}`, "菜单与 readline 输入切换测试", ["填写", "备用", "第三项"]);

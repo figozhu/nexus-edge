@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
     entry = script_dir / "nexus-edge.ts"
     shutil.copyfile(source, entry)
     version = subprocess.run([bun, str(entry), "--version"], cwd=work_dir, capture_output=True, text=True, check=True)
-    assert version.stdout.strip() == "2.3.2", version.stdout
+    assert version.stdout.strip() == "2.3.3", version.stdout
     help_result = subprocess.run([bun, str(entry), "--help"], cwd=work_dir, capture_output=True, text=True, check=True)
     assert "隧道按节点可选" in help_result.stdout and "Shadowsocks" not in help_result.stderr
     assert not (script_dir / ".nexus-edge").exists(), "Help/version should not initialize configuration"
@@ -83,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
                     if error.errno != errno.EIO:
                         raise
         assert "隧道默认关闭".encode() in output
-        # 单文件内核菜单仅查询已有状态，返回后仍能选择第十项退出。
+        # 单文件内核菜单仅查询已有状态，返回后使用字母快捷键退出。
         os.write(master, b"8")
         deadline = time.monotonic() + 10
         core_marker = "检查更新（稳定版，推荐）".encode()
@@ -121,7 +121,9 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
         assert "自动管理".encode() in output[checkpoint:]
         assert "无须开放入站端口".encode() in output[checkpoint:]
         send_expect(b"\x1b", "退出面板（保留后台）")
-        os.write(master, b"0")
+        send_expect(b"j", "是否保留配置文件")
+        send_expect(b"c", "退出面板（保留后台）")
+        os.write(master, b"k")
         process.wait(timeout=5)
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == original, "Terminal mode was not restored"
