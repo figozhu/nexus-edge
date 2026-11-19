@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   // 同时携带可重构建的完整源码和许可说明，便于审计和替换内嵌运行时。
   const common = join(root, "dist", "common");
   mkdirSync(common, { recursive: true });
-  for (const file of ["nexus-edge.ts", "LICENSE", "README.md", "THIRD_PARTY.md", "BUN-LICENSE.md"]) copyFileSync(join(root, file), join(common, file));
+  for (const file of ["nexus-edge.ts", "LICENSE", "README.md", "MIGRATION.md", "THIRD_PARTY.md", "BUN-LICENSE.md"]) copyFileSync(join(root, file), join(common, file));
 }
 
 if (import.meta.main) {

@@ -55,8 +55,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 tests/simple-pty.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/backup-pty.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:NEXUS_EDGE_PTY_STANDALONE = '1'
           python -X utf8 tests/panel-pty.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 tests/backup-pty.py
           exit $LASTEXITCODE
       # 脚本自行创建独立 net/mount namespace，并核对宿主 sysctl 与配置未变。
       # 只对隔离回环接口操作；持久化目录为私有 tmpfs，不修改 runner 的网卡。
@@ -72,5 +76,7 @@ jobs:
           python3 tests/ui-pty.py --bun "$(command -v bun)"
           python3 tests/panel-pty.py --bun "$(command -v bun)"
           python3 tests/simple-pty.py --bun "$(command -v bun)"
+          python3 tests/backup-pty.py --bun "$(command -v bun)"
           NEXUS_EDGE_PTY_STANDALONE=1 python3 tests/panel-pty.py --bun "$(command -v bun)"
+          NEXUS_EDGE_PTY_STANDALONE=1 python3 tests/backup-pty.py --bun "$(command -v bun)"
           python3 tests/release-smoke.py --bun "$(command -v bun)"
