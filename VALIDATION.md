@@ -1,3 +1,19 @@
+# v3.1.0 发布前验证
+
+验证日期：2026-11-20；在配置备份功能提交 `d69bde2` 上同步 `package.json`、`APP_VERSION` 和生成源码到 3.1.0，补齐迁移文档的发布附件校验与版本专属发布说明。
+
+| 检查 | 结果 |
+| --- | --- |
+| 固定依赖、源码生成、TypeScript、v3.1.0 标签一致性、actionlint | 全部通过 |
+| Windows 全量 `bun test` | 556 通过、80 个按平台或外部核心条件跳过、0 失败；3010 断言；沙箱外运行，消除了此前符号链接权限环境失败 |
+| 离线发布回归 | 验证 10 个附件上传完毕后才公开；迁移文档缺失、同数量替代、额外附件在创建草稿前拒绝；上传失败保留草稿；已发布版本不覆盖；版本说明进入草稿 |
+| 三平台构建与汇总 | Windows x64、Linux x64、Linux arm64 交叉编译通过；实际产物汇总为 10 个附件，9 个有效载荷的 SHA-256 全部匹配 |
+| Windows 独立程序 | 无外部 Bun 冒烟和真实 ConPTY 通过，含中文目录、保存设置、加密导出→导入、恢复副本、取消卸载及终端恢复 |
+
+以上为合并前本地证据，均使用隔离目录和合成配置。三个平台的原生回归、PR 和最终主分支发布结果以 [Release workflow](https://github.com/figozhu/nexus-edge/actions/workflows/release.yml) 及 [v3.1.0 Release](https://github.com/figozhu/nexus-edge/releases/tag/v3.1.0) 的对应提交为准。本机未执行 Linux 二进制，未操作运行节点或部署到服务器。
+
+---
+
 # 配置备份 / 迁移验证
 
 验证日期：2026-11-20；Windows x64、Bun 1.4.4、TypeScript 5.9.3。仓库起点为 `57d7eb3`，原工作区干净；现有其他分支未修改。项目 Windows/Linux 共用 TUI，无单独维护的 Windows GUI。

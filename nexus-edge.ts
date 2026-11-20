@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 3.0.0 — 多协议节点管理，兼容独立程序和 TypeScript 单文件。
+ * NexusEdge 3.1.0 — 多协议节点管理，兼容独立程序和 TypeScript 单文件。
  * 运行脚本：bun nexus-edge.ts；独立程序版本无需安装 Bun。
  * 脚本要求 Bun >= 1.4.3；支持 Windows x64 / Linux x64、arm64。
  * 由 scripts/build.ts 从类型化源码生成，不需要 npm 运行时依赖。
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "3.0.0";
+export const APP_VERSION = "3.1.0";
 
 export interface WarpProfile {
   privateKey: string;

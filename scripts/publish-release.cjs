@@ -39,11 +39,15 @@ async function publishRelease({ github, context, core, root = process.cwd() }) {
 
   const directory = path.join(root, 'dist', 'release');
   const files = fs.readdirSync(directory).sort();
-  if (!files.includes('SHA256SUMS') || files.length !== 9) throw new Error('Release 附件集合不完整。');
+  const expected = ['SHA256SUMS', 'nexus-edge-windows-x64.exe', 'nexus-edge-linux-x64', 'nexus-edge-linux-arm64',
+    'nexus-edge.ts', 'LICENSE', 'README.md', 'MIGRATION.md', 'THIRD_PARTY.md', 'BUN-LICENSE.md'].sort();
+  if (JSON.stringify(files) !== JSON.stringify(expected)) throw new Error('Release 附件集合不完整或含未知文件。');
+  const notesPath = path.join(root, 'releases', `${tag}.md`);
+  const notes = fs.existsSync(notesPath) ? { body: fs.readFileSync(notesPath, 'utf8') } : {};
   if (!release) {
     release = (await github.rest.repos.createRelease({
       ...repo, tag_name: tag, target_commitish: context.sha, name: `NexusEdge ${tag}`,
-      draft: true, prerelease: false, generate_release_notes: true,
+      draft: true, prerelease: false, generate_release_notes: true, ...notes,
     })).data;
   }
   // 仅清理同一提交尚未公开的草稿附件；全部重新上传，避免重试混入旧产物。

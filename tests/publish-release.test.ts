@@ -6,12 +6,13 @@ const { publishRelease } = require("../scripts/publish-release.cjs");
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-/** 创建完全离线的 GitHub API 替身和九个测试附件，记录每次写入用于验证发布顺序。 */
+/** 创建完全离线的 GitHub API 替身和十个测试附件，记录每次写入用于验证发布顺序。 */
 function environment(options: { release?: object; tag?: object; uploadFails?: boolean; assets?: object[] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "nexus-publish-test-")); roots.push(root);
   writeFileSync(join(root, "package.json"), JSON.stringify({ version: "3.0.0" }));
   const directory = join(root, "dist", "release"); mkdirSync(directory, { recursive: true });
-  for (const name of ["SHA256SUMS", ...Array.from({ length: 8 }, (_, i) => `asset-${i}`)]) writeFileSync(join(directory, name), "fixture");
+  for (const name of ["SHA256SUMS", "nexus-edge-windows-x64.exe", "nexus-edge-linux-x64", "nexus-edge-linux-arm64",
+    "nexus-edge.ts", "LICENSE", "README.md", "MIGRATION.md", "THIRD_PARTY.md", "BUN-LICENSE.md"]) writeFileSync(join(directory, name), "fixture");
   const writes: { operation: string; args: any }[] = [];
   /** 模拟不存在的 API 对象，保留与 Octokit 一致的 status 字段。 */
   const missing = () => { throw Object.assign(new Error("Not Found"), { status: 404 }); };
@@ -32,12 +33,30 @@ function environment(options: { release?: object; tag?: object; uploadFails?: bo
   return { root, github, context: { eventName: "push", ref: "refs/heads/main", sha: "commit-300", repo: { owner: "test", repo: "test" } }, core: { info: () => {} }, writes };
 }
 
-test("main 推送创建固定提交的版本，九个附件上传后才公开", async () => {
+test("main 推送创建固定提交的版本，十个附件上传后才公开", async () => {
   const env = environment();
   expect(await publishRelease(env)).toMatchObject({ skipped: false, tag: "v3.0.0" });
   expect(env.writes[0]).toMatchObject({ operation: "create", args: { tag_name: "v3.0.0", target_commitish: "commit-300", draft: true } });
-  expect(env.writes.filter(item => item.operation === "upload")).toHaveLength(9);
+  expect(env.writes.filter(item => item.operation === "upload")).toHaveLength(10);
+  expect(env.writes.some(item => item.operation === "upload" && item.args.name === "MIGRATION.md")).toBe(true);
   expect(env.writes.at(-1)).toMatchObject({ operation: "publish", args: { draft: false } });
+});
+test("迁移文档缺失、同数量替代或多余附件均在创建草稿前拒绝", async () => {
+  for (const mode of ["missing", "replaced", "extra"]) {
+    const env = environment();
+    const directory = join(env.root, "dist", "release");
+    if (mode !== "extra") rmSync(join(directory, "MIGRATION.md"));
+    if (mode !== "missing") writeFileSync(join(directory, "unexpected.txt"), "fixture");
+    await expect(publishRelease(env)).rejects.toThrow("附件集合");
+    expect(env.writes).toHaveLength(0);
+  }
+});
+test("版本专属说明随草稿创建，并保留自动生成的变更链接", async () => {
+  const env = environment();
+  mkdirSync(join(env.root, "releases"));
+  writeFileSync(join(env.root, "releases", "v3.0.0.md"), "配置备份 / 迁移说明");
+  await publishRelease(env);
+  expect(env.writes[0]).toMatchObject({ operation: "create", args: { body: "配置备份 / 迁移说明", generate_release_notes: true } });
 });
 test("同版本后续推送不覆盖已公开 Release", async () => {
   const env = environment({ release: { id: 1, draft: false } });
@@ -50,7 +69,7 @@ test("上传失败保留草稿，不能执行公开操作", async () => {
   expect(env.writes.some(item => item.operation === "publish")).toBe(false);
 });
 test("同提交草稿可清理部分附件并重试", async () => {
-  const env = environment({ release: { id: 1, draft: true, target_commitish: "commit-300" }, assets: [{ id: 8, name: "asset-0" }] });
+  const env = environment({ release: { id: 1, draft: true, target_commitish: "commit-300" }, assets: [{ id: 8, name: "MIGRATION.md" }] });
   await publishRelease(env);
   expect(env.writes[0]).toMatchObject({ operation: "delete", args: { asset_id: 8 } });
   expect(env.writes.some(item => item.operation === "create")).toBe(false);
