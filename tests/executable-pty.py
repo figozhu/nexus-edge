@@ -81,15 +81,34 @@ def verify(binary: Path, bun: str | None = None) -> None:
             send(b"\x1b", "退出面板（保留后台）")
             send(b"j", "是否保留配置文件")
             send(b"c", "退出面板（保留后台）")
-            send(b"k", "已退出面板")
+            send(b"k", "导出加密备份")
+            before = config.read_bytes()
+            send(b"a", "保存备份文件路径")
+            send(b"migration.nexus-backup\r", "备份密码（至少 12 个字符）")
+            send(b"synthetic executable password\r", "再次输入备份密码")
+            send(b"synthetic executable password\r", "按 Enter 返回面板")
+            backup = cwd / "migration.nexus-backup"
+            assert backup.exists() and b"synthetic executable password" not in backup.read_bytes()
+            send(b"\r", "退出面板（保留后台）")
+            send(b"k", "导出加密备份")
+            send(b"b", "待导入的 .nexus-backup 文件路径")
+            send(b"migration.nexus-backup\r", "备份密码")
+            send(b"synthetic executable password\r", "确认替换并导入")
+            send(b"b", "按 Enter 返回面板")
+            recovery = list(config.parent.glob("config.json.pre-import.*.bak"))
+            assert len(recovery) == 1 and recovery[0].read_bytes() == before
+            send(b"\r", "退出面板（保留后台）")
+            send(b"l", "已退出面板")
             assert child.wait(timeout=10) == 0
             saved = json.loads(config.read_text(encoding="utf-8"))
-            assert saved["nodes"] == [] and saved["coreIpv6"] is True
-            assert not list(cwd.iterdir())
+            assert saved["nodes"] == [] and saved["coreIpv6"] is False
+            assert saved["firewall"]["mode"] == "manual"
+            assert list(cwd.iterdir()) == [backup]
+            assert b"synthetic executable password" not in output
             assert not (portable / ".nexus-edge" / "runtime.json").exists()
             if os.name != "nt":
                 assert termios.tcgetattr(slave) == original
-            print("PASS 独立程序原生 PTY：无 Bun、中文目录、保存设置、取消卸载、退出及终端恢复")
+            print("PASS 独立程序原生 PTY：无 Bun、中文目录、保存设置、加密导出导入、恢复副本、取消卸载、退出及终端恢复")
         finally:
             if os.name == "nt":
                 child.close()

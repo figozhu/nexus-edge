@@ -1,3 +1,40 @@
+# v3.1.0 发布前验证
+
+验证日期：2026-11-20；在配置备份功能提交 `d69bde2` 上同步 `package.json`、`APP_VERSION` 和生成源码到 3.1.0，补齐迁移文档的发布附件校验与版本专属发布说明。
+
+| 检查 | 结果 |
+| --- | --- |
+| 固定依赖、源码生成、TypeScript、v3.1.0 标签一致性、actionlint | 全部通过 |
+| Windows 全量 `bun test` | 556 通过、80 个按平台或外部核心条件跳过、0 失败；3010 断言；沙箱外运行，消除了此前符号链接权限环境失败 |
+| 离线发布回归 | 验证 10 个附件上传完毕后才公开；迁移文档缺失、同数量替代、额外附件在创建草稿前拒绝；上传失败保留草稿；已发布版本不覆盖；版本说明进入草稿 |
+| 三平台构建与汇总 | Windows x64、Linux x64、Linux arm64 交叉编译通过；实际产物汇总为 10 个附件，9 个有效载荷的 SHA-256 全部匹配 |
+| Windows 独立程序 | 无外部 Bun 冒烟和真实 ConPTY 通过，含中文目录、保存设置、加密导出→导入、恢复副本、取消卸载及终端恢复 |
+
+以上为合并前本地证据，均使用隔离目录和合成配置。三个平台的原生回归、PR 和最终主分支发布结果以 [Release workflow](https://github.com/figozhu/nexus-edge/actions/workflows/release.yml) 及 [v3.1.0 Release](https://github.com/figozhu/nexus-edge/releases/tag/v3.1.0) 的对应提交为准。本机未执行 Linux 二进制，未操作运行节点或部署到服务器。
+
+---
+
+# 配置备份 / 迁移验证
+
+验证日期：2026-11-20；Windows x64、Bun 1.4.4、TypeScript 5.9.3。仓库起点为 `57d7eb3`，原工作区干净；现有其他分支未修改。项目 Windows/Linux 共用 TUI，无单独维护的 Windows GUI。
+
+| 检查 | 结果 |
+| --- | --- |
+| 新增备份单元测试 | 20 通过、1 个 Unix 权限/符号链接场景按平台跳过；86 断言 |
+| 失败保护 | 覆盖错误密码、密文损坏/截断、明文误导入、未知格式/应用/schema/字段、非法配置、重复节点/冲突端口、大小限制、硬链接、已有导出文件、预览后并发编辑、原配置损坏、重复恢复副本、恢复/暂存/重命名故障及导入锁 |
+| 真实 Windows 迁移菜单 | 源模块 7/7、生成单文件 7/7；导出→导入、默认取消、错误密码、损坏文件、Ctrl+C、重复密码错误、运行中拒绝。核对密码不回显、原配置字节及恢复副本；夹具拒绝网络/进程/监听 |
+| 全量 `bun test` | 首次沙箱中 552 通过、80 跳过、2 项既有符号链接测试因 Windows EPERM 失败；在沙箱外重跑对应 `firewall.test.ts` / `updates.test.ts`，69 通过、8 跳过、0 失败，两个环境失败均消除 |
+| 原菜单回归 | UI 6/6、高级编辑 29/29、简易编辑 15/15、生成单文件高级编辑 29/29、截图隐私 6/6 |
+| 三平台构建 | Windows x64、Linux x64 baseline、Linux arm64 `bun build --compile` 成功 |
+| Windows 独立程序 | 无外部 Bun 的 CLI/core-host/空配置 worker/锁释放/临时便携卸载冒烟通过；真实 ConPTY 主菜单加密导出→导入及恢复副本通过，覆盖不同 cwd 与中文路径 |
+| 静态检查 | 固定依赖安装、单文件生成、TypeScript、actionlint、Git 空白检查通过；新增菜单 PTY 已纳入 Windows/Linux CI |
+
+所有配置/凭据均为合成材料，测试在独立临时目录进行，未读取或修改现有运行节点，未改变本机服务、防火墙或网卡。首次独立程序冒烟在沙箱内的权限辅助进程启动失败；在沙箱外重跑临时便携目录冒烟通过。测试依赖仅安装在临时目录。
+
+本机没有 WSL/Linux 运行环境：Linux 两种架构完成交叉构建，但未在本机执行 Linux 二进制。Unix 文件权限、Linux PTY 由已接入的 GitHub Linux CI 验证。真实公网换机、不同云厂商 NAT / DNS、系统服务安装以及 Linux arm64 原生运行未在本轮执行。没有合并、发版或部署；功能分支的最终远端与 CI 状态在交付说明中单独记录。
+
+---
+
 # NexusEdge 3.0.0 独立程序与自动 Release 验证
 
 验证日期：2026-11-09。环境为 Windows x64、Bun 1.4.4、TypeScript 5.9.3、Python 3.12 / pywinpty 3.1.2。以下记录发布前的本地检查；GitHub 原生三平台执行及发布结果见 [Release workflow](https://github.com/figozhu/nexus-edge/actions/workflows/release.yml)。

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * NexusEdge 3.0.0 — 多协议节点管理，兼容独立程序和 TypeScript 单文件。
+ * NexusEdge 3.1.0 — 多协议节点管理，兼容独立程序和 TypeScript 单文件。
  * 运行脚本：bun nexus-edge.ts；独立程序版本无需安装 Bun。
  * 脚本要求 Bun >= 1.4.3；支持 Windows x64 / Linux x64、arm64。
  * 由 scripts/build.ts 从类型化源码生成，不需要 npm 运行时依赖。
@@ -16,7 +16,7 @@ import * as coreUrl from "node:url";
 import * as coreCp from "node:child_process";
 import * as coreDecoder from "node:string_decoder";
 
-export const APP_VERSION = "3.0.0";
+export const APP_VERSION = "3.1.0";
 
 export interface WarpProfile {
   privateKey: string;
@@ -7078,6 +7078,247 @@ export async function runCorePanel(paths: AppPaths, overrides: Partial<CorePanel
 }
 
 
+// ==================== backup.ts ====================
+import * as backupFs from "node:fs";
+import * as backupPath from "node:path";
+import * as backupCrypto from "node:crypto";
+import * as backupNet from "node:net";
+
+// Fixed parameters are part of format v1; untrusted files cannot choose KDF cost.
+const backupFormat = "nexus-edge-backup";
+const backupSuite = "scrypt-32768-8-1/aes-256-gcm";
+const backupLimit = 16 * 1024 * 1024;
+export const BACKUP_FILE_LIMIT = 24 * 1024 * 1024;
+const backupAad = Buffer.from(`${backupFormat}:1:${backupSuite}`);
+
+export interface ConfigBackup { appVersion: string; createdAt: string; config: AppConfig }
+export interface ConfigImportPreview {
+  config: AppConfig;
+  appVersion: string;
+  createdAt: string;
+  /** Exact on-disk bytes fingerprint, including absent/corrupt configuration. */
+  expected: string | null;
+}
+
+export function validateBackupPassword(password: string): string {
+  if (password.length < 12 || Buffer.byteLength(password) > 1024) throw new Error("备份密码须至少 12 个字符，且不超过 1024 UTF-8 字节。请使用独立的长密码。");
+  return password;
+}
+
+function backupKey(password: string, salt: Buffer): Buffer {
+  validateBackupPassword(password);
+  return backupCrypto.scryptSync(password, salt, 32, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+}
+
+/** Reject unknown fields rather than silently dropping data from newer schemas. */
+function backupShape(value: unknown, allowed: string[]): Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => !allowed.includes(key))) throw new Error("备份包含未知字段或无效结构；请使用兼容版本。");
+  return value as Record<string, any>;
+}
+
+function backupValidateConfig(value: unknown): AppConfig {
+  const config = backupShape(value, ["schema", "coreIpv6", "nodes", "warp", "webhook", "firewall"]);
+  backupShape(config.webhook, ["kind", "url"]);
+  if (config.warp !== undefined) backupShape(config.warp, ["privateKey", "addresses", "peerPublicKey", "endpointHost", "endpointPort", "reserved"]);
+  if (config.firewall !== undefined) backupShape(config.firewall, ["mode", "linuxBackend", "firewalldZone"]);
+  if (!Array.isArray(config.nodes)) throw new Error("备份节点列表无效。");
+  for (const node of config.nodes) {
+    backupShape(node, ["id", "name", "enabled", "protocol", "listen", "port", "address", "publicPort", "direct", "egress", "uuid", "username", "password", "method", "transport", "tls", "flow", "vlessEncryption", "vlessDecryption", "vmessSecurity", "hy2", "tuic", "tunnel"]);
+    backupShape(node.transport, ["type", "path", "host", "serviceName", "mode"]);
+    backupShape(node.tls, ["mode", "serverName", "alpn", "certificatePem", "keyPem", "insecure", "reality"]);
+    backupShape(node.tls.reality, ["privateKey", "publicKey", "shortId", "handshakeServer", "handshakePort"]);
+    backupShape(node.hy2, ["obfsPassword", "upMbps", "downMbps"]);
+    backupShape(node.tuic, ["congestionControl", "zeroRttHandshake"]);
+    backupShape(node.tunnel, ["mode", "token", "domain", "connectAddress", "protocol"]);
+  }
+  try { return validateConfig(value, { allowExpiredCertificate: true }); }
+  // Validation messages can contain values from the file. Never echo backup data.
+  catch { throw new Error("备份配置校验失败；原配置未改变。请检查源版本、节点、证书及端口冲突。"); }
+}
+
+/** Encrypt only the portable config model; no runtime files, paths or executables. */
+export function encodeConfigBackup(config: AppConfig, password: string): string {
+  const payload = Buffer.from(JSON.stringify({ appVersion: APP_VERSION, createdAt: new Date().toISOString(), config: backupValidateConfig(config) }));
+  if (payload.length > backupLimit) throw new Error("配置过大，无法导出备份。");
+  const salt = backupCrypto.randomBytes(16), iv = backupCrypto.randomBytes(12);
+  const key = backupKey(password, salt);
+  try {
+    const cipher = backupCrypto.createCipheriv("aes-256-gcm", key, iv);
+    cipher.setAAD(backupAad);
+    const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+    return JSON.stringify({ format: backupFormat, version: 1, suite: backupSuite, salt: salt.toString("base64"), iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: encrypted.toString("base64") }) + "\n";
+  } finally { key.fill(0); payload.fill(0); }
+}
+
+function backupBase64(value: unknown, length?: number): Buffer {
+  if (typeof value !== "string" || !value.length) throw new Error("备份编码无效。");
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.toString("base64") !== value || (length !== undefined && bytes.length !== length)) throw new Error("备份编码无效。");
+  return bytes;
+}
+
+/** Authenticate before JSON parsing; all metadata containing user data is encrypted. */
+export function decodeConfigBackup(text: string, password: string): ConfigBackup {
+  if (Buffer.byteLength(text) > BACKUP_FILE_LIMIT) throw new Error("备份文件超过 24 MiB 限制。");
+  let envelope: Record<string, any>;
+  try { envelope = backupShape(JSON.parse(text), ["format", "version", "suite", "salt", "iv", "tag", "data"]); }
+  catch { throw new Error("备份文件损坏或格式无效。"); }
+  if (envelope.format !== backupFormat || envelope.version !== 1 || envelope.suite !== backupSuite) throw new Error("不支持此备份版本或加密格式，请使用兼容的 NexusEdge 版本。");
+  const salt = backupBase64(envelope.salt, 16), iv = backupBase64(envelope.iv, 12), tag = backupBase64(envelope.tag, 16), encrypted = backupBase64(envelope.data);
+  if (encrypted.length > backupLimit) throw new Error("备份内容超过大小限制。");
+  const key = backupKey(password, salt);
+  let plain: Buffer;
+  try {
+    const decipher = backupCrypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAAD(backupAad); decipher.setAuthTag(tag);
+    plain = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  } catch { throw new Error("密码错误或备份已损坏；原配置未改变。"); }
+  finally { key.fill(0); }
+  let payload: Record<string, any>;
+  try { payload = backupShape(JSON.parse(plain.toString("utf8")), ["appVersion", "createdAt", "config"]); }
+  catch { throw new Error("备份内容损坏或版本不兼容。"); }
+  finally { plain.fill(0); }
+  if (typeof payload.appVersion !== "string" || !/^3\.\d+\.\d+$/.test(payload.appVersion) || typeof payload.createdAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(payload.createdAt) || !Number.isFinite(Date.parse(payload.createdAt))) throw new Error("备份元数据无效或应用版本不兼容。");
+  return { appVersion: payload.appVersion, createdAt: payload.createdAt, config: backupValidateConfig(payload.config) };
+}
+
+/** Bounded regular-file read, rejecting symlinks, devices and hardlinks. */
+function backupReadFile(path: string, limit: number): Buffer {
+  const before = backupFs.lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > limit) throw new Error("请选择大小受限的普通文件，不支持链接文件。");
+  const fd = backupFs.openSync(path, backupFs.constants.O_RDONLY | (backupFs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = backupFs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > limit) throw new Error("文件已改变，请重新选择。");
+    const bytes = Buffer.alloc(opened.size + 1);
+    let length = 0;
+    while (length < bytes.length) { const count = backupFs.readSync(fd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
+    if (length !== opened.size) throw new Error("文件在读取时发生变化。");
+    return bytes.subarray(0, length);
+  } finally { backupFs.closeSync(fd); }
+}
+
+/** Exclusive creation never overwrites a destination; failed partial writes are removed. */
+function backupCreateFile(path: string, bytes: string | Buffer): void {
+  const fd = backupFs.openSync(path, "wx", 0o600);
+  let complete = false;
+  try { backupFs.writeFileSync(fd, bytes); backupFs.fsyncSync(fd); complete = true; }
+  finally {
+    backupFs.closeSync(fd);
+    if (!complete) { try { backupFs.unlinkSync(path); } catch {} }
+  }
+}
+
+export function exportConfigBackup(config: AppConfig, filename: string, password: string): void {
+  if (backupPath.extname(filename).toLowerCase() !== ".nexus-backup") throw new Error("备份文件名必须以 .nexus-backup 结尾。");
+  const encrypted = encodeConfigBackup(config, password);
+  try { backupCreateFile(filename, encrypted); }
+  catch { throw new Error("无法保存备份：请使用可写目录中的新文件名；不会覆盖已有文件。"); }
+}
+
+/** Read current bytes without initializing, migrating or repairing config. */
+function backupCurrent(paths: AppPaths): Buffer | null {
+  try { return backupReadFile(paths.config, backupLimit); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+}
+function backupFingerprint(bytes: Buffer | null): string | null { return bytes === null ? null : backupCrypto.createHash("sha256").update(bytes).digest("hex"); }
+
+/** New-host defaults: retain identity/credentials, require deliberate activation. */
+export function prepareConfigImport(paths: AppPaths, filename: string, password: string): ConfigImportPreview {
+  let encrypted: string;
+  try { encrypted = backupReadFile(filename, BACKUP_FILE_LIMIT).toString("utf8"); }
+  catch { throw new Error("无法读取备份：请选择不超过 24 MiB 的普通文件。"); }
+  const backup = decodeConfigBackup(encrypted, password);
+  const config = structuredClone(backup.config);
+  config.firewall = { mode: "manual", linuxBackend: "auto", firewalldZone: "" };
+  config.webhook = { kind: "none", url: "" };
+  config.coreIpv6 = false;
+  for (const node of config.nodes) {
+    node.enabled = false;
+    // Preserve wildcard/loopback semantics; remove bindings to old NIC addresses.
+    if (!["0.0.0.0", "::", "127.0.0.1", "::1"].includes(node.listen)) node.listen = backupNet.isIP(node.listen) === 6 ? "::" : "0.0.0.0";
+    if (backupNet.isIP(node.address)) node.address = "";
+    node.tunnel.connectAddress = "";
+  }
+  return { ...backup, config: backupValidateConfig(config), expected: backupFingerprint(backupCurrent(paths)) };
+}
+
+/** Save only after preview/confirmation. No service, firewall, network or core calls. */
+export function commitConfigImport(paths: AppPaths, preview: ConfigImportPreview): { recovery: string | null } {
+  const candidate = JSON.stringify(backupValidateConfig(preview.config), null, 2) + "\n";
+  ensureDataDir(paths);
+  const lock = backupPath.join(paths.data, "config-import.lock");
+  let lockFd: number;
+  try { lockFd = backupFs.openSync(lock, "wx", 0o600); }
+  catch { throw new Error("另一个导入正在进行，或上次导入被中断；确认没有导入进程后移除 config-import.lock 再重试。"); }
+  const suffix = `${Date.now()}.${backupCrypto.randomBytes(8).toString("hex")}`;
+  const staging = backupPath.join(paths.data, `config-import.${suffix}.tmp`);
+  let recovery: string | null = null;
+  try {
+    const original = backupCurrent(paths);
+    if (backupFingerprint(original) !== preview.expected) throw new Error("配置已在另一处修改，请重新预览后导入。");
+    if (original !== null) {
+      recovery = backupPath.join(paths.data, `config.json.pre-import.${suffix}.bak`);
+      backupCreateFile(recovery, original);
+    }
+    backupCreateFile(staging, candidate);
+    if (backupFingerprint(backupCurrent(paths)) !== preview.expected) throw new Error("配置已在另一处修改，请重新预览后导入。");
+    // Rename is the commit point. All potentially failing writes precede it.
+    backupFs.renameSync(staging, paths.config);
+    return { recovery };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("配置已在另一处修改")) throw error;
+    throw new Error("导入保存失败，原配置未改变；请检查目录权限、磁盘空间并重试。");
+  } finally {
+    try { backupFs.unlinkSync(staging); } catch {}
+    try { backupFs.closeSync(lockFd); } catch {}
+    try { backupFs.unlinkSync(lock); } catch {}
+  }
+}
+
+
+// ==================== backup-panel.ts ====================
+import * as backupPanelPath from "node:path";
+
+export interface BackupPanelServices { running: (paths: AppPaths) => Promise<boolean> }
+const backupPanelNotice = "包含 UUID、密码、证书私钥、Tunnel Token 和 WARP 凭据；文件以密码加密。\n请妥善保存文件，密码通过另一渠道传递；丢失密码无法恢复。不会自动上传备份。";
+
+/** Shared Windows/Linux terminal flow. Confirmed imports only save, never apply. */
+export async function runBackupPanel(paths: AppPaths, overrides: Partial<BackupPanelServices> = {}): Promise<void> {
+  const service: BackupPanelServices = { running: async paths => Boolean(await getDaemonStatus(paths)), ...overrides };
+  const action = await selectMenu("配置备份 / 迁移", `${backupPanelNotice}\n迁移整个节点配置；客户端配置仍在“查看链接 / 导出客户端配置”。`, ["导出加密备份", "导入加密备份", "返回"]);
+  if (action === 2) return;
+  if (action === 0) {
+    const defaultName = backupPanelPath.join(paths.root, `nexus-edge-${new Date().toISOString().replace(/[:.]/g, "-")}.nexus-backup`);
+    const filename = (await promptInput("保存备份文件路径（新文件）", defaultName)).replace(/^"(.*)"$/, "$1");
+    const password = await uiValidatedInput("备份密码（至少 12 个字符）", "", validateBackupPassword, { secret: true });
+    const repeated = await promptInput("再次输入备份密码", "", { secret: true });
+    if (repeated !== password) throw new Error("两次密码不一致，未导出文件。");
+    exportConfigBackup(readConfig(paths), filename, password);
+    console.log(`加密备份已保存：${filename}\n请将该文件与密码分别安全传到新服务器。`);
+    return;
+  }
+  if (await service.running(paths)) throw new Error("请先从主菜单停止全部节点，再导入配置。导入不会停止服务或修改防火墙。");
+  const filename = (await promptInput("待导入的 .nexus-backup 文件路径")).replace(/^"(.*)"$/, "$1");
+  const password = await promptInput("备份密码", "", { secret: true });
+  const preview = prepareConfigImport(paths, filename, password);
+  const choice = await selectMenu("确认导入配置", [
+    `来源版本：${preview.appVersion}；备份时间：${preview.createdAt}`,
+    `节点：${preview.config.nodes.length} 个；WARP：${preview.config.warp ? "包含" : "无"}`,
+    `目标：${paths.config}`,
+    preview.expected === null ? "将在当前目录创建配置。" : "将替换当前配置（不合并）；覆盖前保存独立的原配置恢复副本。",
+    "全部节点停用；旧服务器 IP 清空，域名保留但须核对 DNS / NAT / 端口及 TLS 证书。",
+    "专用网卡监听改为同族通配地址；原通配 / 回环监听保留；隧道连接覆盖地址清空。",
+    "防火墙改为手动、通知关闭、核心出站 IPv6 关闭；原机器服务和防火墙规则不迁移。",
+    "导入后在节点管理检查并启用节点，再手动启动；不会自动启动、安装核心或开放端口。",
+  ].join("\n"), ["取消，保留当前配置", "确认替换并导入"]);
+  if (choice !== 1) throw new UserCancelledError();
+  if (await service.running(paths)) throw new Error("后台已启动，请停止全部节点后重新导入；原配置未改变。");
+  const result = commitConfigImport(paths, preview);
+  console.log(`配置已导入，全部节点保持停用。${result.recovery ? `\n原配置恢复副本：${result.recovery}` : ""}\n请检查连接地址、监听端口、证书、DNS 和防火墙设置，再启用及启动节点。`);
+}
+
+
 // ==================== panel.ts ====================
 import * as panelFs from "node:fs";
 import * as panelPath from "node:path";
@@ -7720,8 +7961,8 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "退出面板（保留后台）"]);
-    if (choice === 10) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "配置备份 / 迁移", "退出面板（保留后台）"]);
+    if (choice === 11) return "exit";
     try {
       if (choice === 0) {
         if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
@@ -7735,6 +7976,7 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       else if (choice === 6 && await panelStartup(paths, startup)) return "handoff";
       else if (choice === 7) { await runCorePanel(paths); continue; }
       else if (choice === 8) { await panelNetworkSettings(paths); continue; }
+      else if (choice === 10) await runBackupPanel(paths);
       else if (choice === 9) {
         const keep = await confirmUninstall(paths);
         if (keep === null) continue;

@@ -26,7 +26,7 @@ export async function assembleRelease(artifactRoot: string): Promise<string> {
   }
   const build = Bun.spawn([process.execPath, "scripts/build.ts"], { cwd: root, stdout: "inherit", stderr: "inherit" });
   if (await build.exited !== 0) throw new Error("发布源码生成失败。");
-  for (const file of ["nexus-edge.ts", "LICENSE", "README.md", "THIRD_PARTY.md", "BUN-LICENSE.md"]) {
+  for (const file of ["nexus-edge.ts", "LICENSE", "README.md", "MIGRATION.md", "THIRD_PARTY.md", "BUN-LICENSE.md"]) {
     copyFileSync(join(root, file), join(output, file)); files.push(file);
   }
   // 拒绝脏目录中的旧附件；失败时请使用新的构建目录，不自动覆盖或发布未知文件。
