@@ -8,3 +8,4 @@ dist/
 .bun-cache/
 *.nexus-backup
 config.json.pre-import.*.bak
+traffic.sqlite*

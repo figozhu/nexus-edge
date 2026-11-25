@@ -127,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix="nexus-release-smoke-") as directory:
         send_expect(b"k", "导出加密备份")
         send_expect(b"c", "按 Enter 返回面板")
         send_expect(b"\r", "退出面板（保留后台）")
-        os.write(master, b"l")
+        os.write(master, b"m")
         process.wait(timeout=5)
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == original, "Terminal mode was not restored"

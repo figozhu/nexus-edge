@@ -17,6 +17,7 @@ import { isCoreIpv6Enabled } from "./core.ts";
 import { runHostIpv6Panel } from "./ipv6-panel.ts";
 import { confirmUninstall, requestUninstall } from "./uninstall.ts";
 import { runBackupPanel } from "./backup-panel.ts";
+import { runTrafficPanel } from "./traffic-panel.ts";
 
 const panelProtocolLabels: Record<NodeProtocol, string> = {
   vless: "VLESS", vmess: "VMess", shadowsocks: "Shadowsocks / SS2022", trojan: "Trojan",
@@ -654,8 +655,8 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "配置备份 / 迁移", "退出面板（保留后台）"]);
-    if (choice === 11) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "配置备份 / 迁移", "流量统计 / 分析", "退出面板（保留后台）"]);
+    if (choice === 12) return "exit";
     try {
       if (choice === 0) {
         if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
@@ -670,6 +671,7 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       else if (choice === 7) { await runCorePanel(paths); continue; }
       else if (choice === 8) { await panelNetworkSettings(paths); continue; }
       else if (choice === 10) await runBackupPanel(paths);
+      else if (choice === 11) { await runTrafficPanel(paths); continue; }
       else if (choice === 9) {
         const keep = await confirmUninstall(paths);
         if (keep === null) continue;

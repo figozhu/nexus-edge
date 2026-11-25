@@ -10,6 +10,26 @@ permissions:
   contents: read
 
 jobs:
+  traffic-web:
+    name: Chromium / 流量分析网页
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - name: 验证图表、筛选、移动布局和访问边界
+        run: bun tests/traffic-browser.ts
+        env:
+          NEXUS_EDGE_SCREENSHOTS: ${{ runner.temp }}/nexus-traffic-screenshots
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: traffic-dashboard-synthetic
+          path: ${{ runner.temp }}/nexus-traffic-screenshots/*.png
+          retention-days: 7
   test:
     name: ${{ matrix.os }} / Bun 1.4.4
     runs-on: ${{ matrix.os }}

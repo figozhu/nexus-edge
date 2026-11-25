@@ -1320,6 +1320,414 @@ export function applySimpleTunnel(node: NodeConfig, mode: NodeConfig["tunnel"]["
 }
 
 
+// ==================== traffic-core.ts ====================
+import * as trafficHttp2 from "node:http2";
+import * as trafficNet from "node:net";
+
+export interface TrafficEndpoint { port: number; secret: string }
+export interface TrafficCounter { id: string; up: number; down: number }
+export interface TrafficConnection extends TrafficCounter { nodeId: string; ip: string; closed: boolean; closedAt?: number }
+export interface TrafficSnapshot {
+  up: number; down: number;
+  nodes: TrafficCounter[];
+  connections: TrafficConnection[];
+  peers: { nodeId: string; ip: string; seenAt: number }[];
+  peersAvailable: boolean;
+}
+
+/** Only attach instrumentation to the worker's generated configuration, never saved credentials. */
+export function withTrafficInstrumentation(generated: object, engine: CoreName, endpoint: TrafficEndpoint): object {
+  if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535 || !/^[a-f0-9]{64}$/.test(endpoint.secret)) throw new Error("无效的本地统计接口。");
+  const config = structuredClone(generated) as Record<string, any>;
+  if (engine === "xray") {
+    config.stats = {};
+    // Xray's direct API listener has no authentication. Route a password-only
+    // loopback SOCKS inbound into StatsService instead, so a proxy client cannot
+    // reach/reset statistics by requesting the server's loopback TCP address.
+    config.api = { tag: "nexus-traffic-api", services: ["StatsService"] };
+    config.policy = { levels: { "0": { statsUserUplink: true, statsUserDownlink: true, statsUserOnline: true } } };
+    for (const inbound of config.inbounds) for (const client of inbound.settings.clients) client.email = `nexus:${inbound.tag.slice(5)}`;
+    config.inbounds.push({ tag: "nexus-traffic", listen: "127.0.0.1", port: endpoint.port, protocol: "socks", settings: { auth: "password", accounts: [{ user: "nexus-traffic", pass: endpoint.secret }], udp: false } });
+    config.routing ??= { domainStrategy: "AsIs", rules: [] };
+    config.routing.rules.unshift({ type: "field", inboundTag: ["nexus-traffic"], outboundTag: "nexus-traffic-api" });
+  } else {
+    config.services = [{ type: "api", tag: "nexus-traffic", listen: "127.0.0.1", listen_port: endpoint.port, secret: endpoint.secret,
+      access_control_allow_origin: ["http://nexus.invalid"], access_control_allow_private_network: false }];
+  }
+  return config;
+}
+
+const trafficMaxMessage = 8 * 1024 * 1024;
+type TrafficProtoFields = Map<number, (Buffer | bigint)[]>;
+
+/** Bounded protobuf wire reader; accepts only ordinary wire types, never evals schemas or payloads. */
+export function trafficReadProto(bytes: Buffer): TrafficProtoFields {
+  if (bytes.length > trafficMaxMessage) throw new Error("统计响应过大。");
+  let offset = 0;
+  const variable = (): bigint => {
+    let value = 0n;
+    for (let shift = 0n; shift < 70n; shift += 7n) {
+      if (offset >= bytes.length) throw new Error("统计响应截断。");
+      const b = bytes[offset++]!;
+      if (shift === 63n && b > 1) throw new Error("统计数值溢出。");
+      value |= BigInt(b & 127) << shift;
+      if (!(b & 128)) return value;
+    }
+    throw new Error("统计数值溢出。");
+  };
+  const fields: TrafficProtoFields = new Map(); let count = 0;
+  while (offset < bytes.length) {
+    if (++count > 65536) throw new Error("统计字段数量超限。");
+    const tag = variable();
+    const field = Number(tag >> 3n), wire = Number(tag & 7n);
+    if (field < 1 || field > 536870911) throw new Error("无效的统计字段。");
+    let value: Buffer | bigint;
+    if (wire === 0) value = variable();
+    else {
+      const length = wire === 2 ? Number(variable()) : wire === 1 ? 8 : wire === 5 ? 4 : -1;
+      if (!Number.isSafeInteger(length) || length < 0 || length > bytes.length - offset) throw new Error("无效的统计字段长度。");
+      value = bytes.subarray(offset, offset + length); offset += length;
+      if (wire !== 2) continue;
+    }
+    const values = fields.get(field) ?? []; values.push(value); fields.set(field, values);
+  }
+  return fields;
+}
+
+function trafficProtoBytes(fields: TrafficProtoFields, field: number): Buffer {
+  const value = fields.get(field)?.[0];
+  if (value === undefined) return Buffer.alloc(0);
+  if (!Buffer.isBuffer(value)) throw new Error("统计字段类型不符。");
+  return value;
+}
+function trafficProtoText(fields: TrafficProtoFields, field: number): string { return trafficProtoBytes(fields, field).toString("utf8"); }
+function trafficProtoNumber(fields: TrafficProtoFields, field: number): number {
+  const value = fields.get(field)?.[0] ?? 0n;
+  if (typeof value !== "bigint" || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("统计数值超出安全范围。");
+  return Number(value);
+}
+function trafficProtoString(value: string): Buffer {
+  const bytes = Buffer.from(value), length: number[] = [];
+  let n = bytes.length;
+  do { length.push((n & 127) | (n > 127 ? 128 : 0)); n >>>= 7; } while (n);
+  return Buffer.concat([Buffer.from([10, ...length]), bytes]);
+}
+
+/** Authenticate before speaking HTTP/2; the secret never enters URLs or logs. */
+async function trafficXrayConnection(endpoint: TrafficEndpoint): Promise<trafficNet.Socket> {
+  if (!/^[a-f0-9]{64}$/.test(endpoint.secret)) throw new Error("无效的统计接口认证。");
+  const socket = trafficNet.createConnection({ host: "127.0.0.1", port: endpoint.port });
+  return new Promise((resolve, reject) => {
+    let stage = 0, pending = Buffer.alloc(0), done = false;
+    const timer = setTimeout(() => fail(), 1500);
+    const cleanup = () => { clearTimeout(timer); socket.off("data", receive); socket.off("error", fail); socket.off("close", fail); };
+    const fail = () => { if (done) return; done = true; cleanup(); socket.destroy(); reject(new Error("统计接口连接或认证失败。")); };
+    const receive = (data: Buffer) => {
+      pending = Buffer.concat([pending, data]);
+      if (pending.length > 512) return fail();
+      if (stage < 2 && pending.length < 2) return;
+      if (stage === 0) {
+        if (pending[0] !== 5 || pending[1] !== 2) return fail(); pending = pending.subarray(2); stage = 1;
+        const user = Buffer.from("nexus-traffic"), password = Buffer.from(endpoint.secret);
+        socket.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([password.length]), password]));
+      } else if (stage === 1) {
+        if (pending[0] !== 1 || pending[1] !== 0) return fail(); pending = pending.subarray(2); stage = 2;
+        socket.write(Buffer.from([5, 1, 0, 1, 127, 0, 0, 1, 0, 1]));
+      } else {
+        if (pending.length < 4) return;
+        if (pending[0] !== 5 || pending[1] !== 0 || ![1, 4].includes(pending[3]!)) return fail();
+        const length = pending[3] === 4 ? 22 : 10;
+        if (pending.length < length) return;
+        done = true; cleanup(); socket.pause();
+        if (pending.length > length) socket.unshift(pending.subarray(length));
+        resolve(socket);
+      }
+    };
+    socket.on("error", fail); socket.on("close", fail); socket.on("data", receive);
+    socket.once("connect", () => socket.write(Buffer.from([5, 1, 2])));
+  });
+}
+
+/** Calls only loopback, bypassing environment proxies. Read-only RPCs never set reset=true. */
+export async function trafficRpc(endpoint: TrafficEndpoint, method: string, payload: Buffer = Buffer.alloc(0), firstMessage = false): Promise<Buffer> {
+  if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) throw new Error("无效的统计端口。");
+  const xray = method.startsWith("/xray.app.stats.command.StatsService/");
+  const socket = xray ? await trafficXrayConnection(endpoint) : undefined;
+  return new Promise((resolve, reject) => {
+    const client = trafficHttp2.connect(`http://127.0.0.1:${endpoint.port}`, socket ? { createConnection: () => socket } : {});
+    let settled = false, response: Buffer | undefined, pending = Buffer.alloc(0), received = 0, grpcStatus = "";
+    const timer = setTimeout(() => finish(new Error("统计接口超时。")), 1800);
+    const finish = (error?: Error) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      stream.close(); client.destroy();
+      if (error) reject(error); else resolve(response!);
+    };
+    client.on("error", () => finish(new Error("统计接口暂不可用。")));
+    const stream = client.request({ ":method": "POST", ":path": method, "content-type": "application/grpc", te: "trailers", "grpc-timeout": "1500m",
+      ...(!xray && endpoint.secret ? { authorization: `Bearer ${endpoint.secret}` } : {}) });
+    stream.on("response", headers => {
+      if (headers[":status"] !== 200 || !String(headers["content-type"] ?? "").startsWith("application/grpc")) finish(new Error("统计接口响应无效。"));
+      if (headers["grpc-status"] !== undefined) grpcStatus = String(headers["grpc-status"]);
+    });
+    stream.on("trailers", headers => { grpcStatus = String(headers["grpc-status"] ?? ""); });
+    stream.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      received += chunk.length;
+      if (received > trafficMaxMessage + 5) { finish(new Error("统计响应过大。")); return; }
+      pending = Buffer.concat([pending, chunk]);
+      if (pending.length < 5) return;
+      const size = pending.readUInt32BE(1);
+      if (pending[0] !== 0 || size > trafficMaxMessage) { finish(new Error("统计响应格式不支持。")); return; }
+      if (pending.length < size + 5) return;
+      if (response) { finish(new Error("统计响应包含多余数据。")); return; }
+      response = pending.subarray(5, size + 5); pending = pending.subarray(size + 5);
+      if (firstMessage) finish();
+    });
+    stream.on("error", () => finish(new Error("统计连接中断。")));
+    stream.on("end", () => {
+      if (grpcStatus !== "0" || !response || pending.length) finish(new Error(`统计接口不可用（gRPC ${/^[0-9]+$/.test(grpcStatus) ? grpcStatus : "unknown"}）。`));
+      else finish();
+    });
+    const frame = Buffer.alloc(5); frame.writeUInt32BE(payload.length, 1); stream.end(Buffer.concat([frame, payload]));
+  });
+}
+
+function trafficSourceIp(source: string): string {
+  if (trafficNet.isIP(source)) return source;
+  const ip = source.startsWith("[") ? source.slice(1, source.indexOf("]")) : source.replace(/:\d+$/, "");
+  return trafficNet.isIP(ip) ? ip : "";
+}
+
+export function parseXrayTraffic(bytes: Buffer, nodeIds: string[]): TrafficSnapshot {
+  const counters = new Map(nodeIds.map(id => [id, { id, up: 0, down: 0 }]));
+  const seen = new Set<string>();
+  for (const item of trafficReadProto(bytes).get(1) ?? []) {
+    if (!Buffer.isBuffer(item)) throw new Error("无效的入站计数。");
+    const stat = trafficReadProto(item), name = trafficProtoText(stat, 1);
+    const match = /^user>>>nexus:(.+)>>>traffic>>>(uplink|downlink)$/.exec(name);
+    if (!match || !counters.has(match[1]!)) continue;
+    if (seen.has(name)) throw new Error("重复的入站计数。"); seen.add(name);
+    counters.get(match[1]!)![match[2] === "uplink" ? "up" : "down"] = trafficProtoNumber(stat, 2);
+  }
+  const nodes = [...counters.values()];
+  return { up: nodes.reduce((sum, n) => sum + n.up, 0), down: nodes.reduce((sum, n) => sum + n.down, 0), nodes, connections: [], peers: [], peersAvailable: true };
+}
+
+export function parseSingTraffic(statusBytes: Buffer, connectionBytes: Buffer, nodeIds: string[]): TrafficSnapshot {
+  const status = trafficReadProto(statusBytes), messages = trafficReadProto(connectionBytes);
+  if (!trafficProtoNumber(status, 5) || trafficProtoNumber(messages, 2) !== 1) throw new Error("该核心未提供完整统计快照。");
+  const nodes = new Set(nodeIds), connections: TrafficConnection[] = [], ids = new Set<string>();
+  for (const item of messages.get(1) ?? []) {
+    if (!Buffer.isBuffer(item)) throw new Error("无效的连接统计。");
+    const event = trafficReadProto(item), c = trafficReadProto(trafficProtoBytes(event, 3));
+    const id = trafficProtoText(c, 1), tag = trafficProtoText(c, 2);
+    if (!tag.startsWith("node:") || !nodes.has(tag.slice(5))) continue;
+    if (!/^[a-f0-9-]{36}$/.test(id) || ids.has(id)) throw new Error("无效或重复的连接标识。"); ids.add(id);
+    const closedAt = trafficProtoNumber(c, 13);
+    connections.push({ id, nodeId: tag.slice(5), ip: trafficSourceIp(trafficProtoText(c, 6)), up: trafficProtoNumber(c, 16), down: trafficProtoNumber(c, 17), closed: closedAt > 0, closedAt });
+  }
+  return { up: trafficProtoNumber(status, 8), down: trafficProtoNumber(status, 9), nodes: [], connections, peers: [], peersAvailable: true };
+}
+
+/** Fixed-version native adapters. Only safe node IDs/IPs/counters leave this module, never destinations or credentials. */
+export async function collectCoreTraffic(engine: CoreName, endpoint: TrafficEndpoint, nodes: Pick<NodeConfig, "id">[]): Promise<TrafficSnapshot> {
+  if (engine === "singBox") {
+    const connections = await trafficRpc(endpoint, "/daemon.StartedService/SubscribeConnections", undefined, true);
+    const status = await trafficRpc(endpoint, "/daemon.StartedService/SubscribeStatus", undefined, true);
+    return parseSingTraffic(status, connections, nodes.map(n => n.id));
+  }
+  const prefix = "/xray.app.stats.command.StatsService/";
+  const result = parseXrayTraffic(await trafficRpc(endpoint, prefix + "QueryStats", trafficProtoString("user>>>nexus:")), nodes.map(n => n.id));
+  // Bounded concurrency; a missing online-user map is normal until the first authenticated connection.
+  const start = (Math.floor(Date.now() / 10_000) % Math.max(1, Math.ceil(nodes.length / 8))) * 8;
+  await Promise.all(nodes.slice(start, start + 8).map(async node => {
+    try {
+      const bytes = await trafficRpc(endpoint, prefix + "GetStatsOnlineIpList", trafficProtoString(`user>>>nexus:${node.id}>>>online`));
+      for (const entry of trafficReadProto(bytes).get(2) ?? []) {
+        if (!Buffer.isBuffer(entry)) throw new Error("无效的来源信息。");
+        // The upstream timestamp is the last connection's start, not its last
+        // activity. Membership means an active connection at this observation.
+        const fields = trafficReadProto(entry), ip = trafficSourceIp(trafficProtoText(fields, 1));
+        if (ip) result.peers.push({ nodeId: node.id, ip, seenAt: Date.now() });
+      }
+    } catch (error) { if (!(error instanceof Error && error.message.includes("gRPC 5"))) result.peersAvailable = false; }
+  }));
+  return result;
+}
+
+
+// ==================== traffic-store.ts ====================
+import * as trafficStoreFs from "node:fs";
+import * as trafficStorePath from "node:path";
+import * as trafficSqlite from "bun:sqlite";
+
+export const TRAFFIC_INTERVAL_MS = 10_000;
+export const TRAFFIC_BUCKET_MS = 300_000;
+export const TRAFFIC_RETENTION_MS = 30 * 86400_000;
+export const TRAFFIC_RANGES = { "1h": 3600_000, "24h": 86400_000, "7d": 7 * 86400_000, "30d": TRAFFIC_RETENTION_MS } as const;
+export type TrafficRange = keyof typeof TRAFFIC_RANGES;
+type TrafficDimension = { key: string; kind: "core" | "node" | "peer"; engine: CoreName; nodeId: string; name: string; port: number; protocol: string; ip: string; quality: string };
+type TrafficBaseline = { generation: string; at: number; up: number; down: number; nodes: Map<string, { up: number; down: number }>; connections: Map<string, { up: number; down: number; seen: number }> };
+export interface TrafficReport {
+  now: number; from: number; oldest: number | null; range: TrafficRange; bucketMs: number; retentionDays: number;
+  cores: any[]; nodes: any[]; peers: any[]; series: any[]; status: any[]; events: any[]; limited: boolean;
+}
+
+export function trafficDatabasePath(paths: AppPaths): string { return trafficStorePath.join(paths.data, "traffic.sqlite"); }
+function trafficCheckDatabase(paths: AppPaths): void {
+  if (trafficStoreFs.existsSync(paths.data) && trafficStoreFs.lstatSync(paths.data).isSymbolicLink()) throw new Error("统计数据目录不能是符号链接。");
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const filename = trafficDatabasePath(paths) + suffix;
+    try { const stat = trafficStoreFs.lstatSync(filename); if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("统计数据库不能是链接或特殊文件。"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+function trafficSafeCount(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("统计计数不在安全范围内。");
+  return value;
+}
+function trafficNodeDimension(engine: CoreName, node: NodeConfig): TrafficDimension {
+  return { key: `${engine}:${node.id}:${node.port}`, kind: "node", engine, nodeId: node.id, name: node.name, port: node.port, protocol: node.protocol, ip: "", quality: engine === "xray" ? "counter" : "observed" };
+}
+
+/** Single worker writes; read-only panels never reset counters. SQLite commits a sample and its rollups atomically. */
+export class TrafficStore {
+  private db: trafficSqlite.Database;
+  private baselines = new Map<CoreName, TrafficBaseline>();
+  private lastPrune = 0;
+  constructor(paths: AppPaths) {
+    ensureDataDir(paths); trafficCheckDatabase(paths);
+    this.db = new trafficSqlite.Database(trafficDatabasePath(paths), { create: true });
+    try {
+      const version = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+      if (version !== 0 && version !== 1) throw new Error("统计数据库版本不兼容，原文件保持不变。");
+      if (version === 0 && this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) throw new Error("统计数据库格式不兼容，原文件保持不变。");
+      this.db.exec("PRAGMA busy_timeout=1500; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA max_page_count=16384;");
+      this.db.exec(`CREATE TABLE IF NOT EXISTS dimensions (key TEXT PRIMARY KEY, kind TEXT NOT NULL, engine TEXT NOT NULL, nodeId TEXT NOT NULL, name TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL, ip TEXT NOT NULL, quality TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS buckets (bucket INTEGER NOT NULL, key TEXT NOT NULL, up INTEGER NOT NULL, down INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY(bucket,key));
+        CREATE TABLE IF NOT EXISTS status (engine TEXT PRIMARY KEY, generation TEXT NOT NULL, lastSeen INTEGER NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL, peersAvailable INTEGER NOT NULL, upRate REAL, downRate REAL);
+        CREATE TABLE IF NOT EXISTS events (at INTEGER NOT NULL, engine TEXT NOT NULL, code TEXT NOT NULL);
+        PRAGMA user_version=1;`);
+      if (process.platform !== "win32") for (const suffix of ["", "-wal", "-shm"]) if (trafficStoreFs.existsSync(trafficDatabasePath(paths) + suffix)) trafficStoreFs.chmodSync(trafficDatabasePath(paths) + suffix, 0o600);
+    } catch (error) { this.db.close(); throw error; }
+  }
+  close(): void { this.db.close(); }
+  stopped(): void { this.db.query("UPDATE status SET state='stopped',upRate=NULL,downRate=NULL").run(); }
+  unavailable(engine: CoreName, generation: string, now = Date.now()): void {
+    const old = this.db.query("SELECT state FROM status WHERE engine=?").get(engine) as { state: string } | null;
+    this.db.transaction(() => {
+      if (old?.state !== "unavailable") this.db.query("INSERT INTO events VALUES (?,?,?)").run(now, engine, "unavailable");
+      this.db.query("INSERT INTO status VALUES (?,?,0,'unavailable',?,0,NULL,NULL) ON CONFLICT(engine) DO UPDATE SET state='unavailable',detail=excluded.detail,upRate=NULL,downRate=NULL")
+        .run(engine, generation, "统计接口暂不可用或不受此核心版本支持；历史记录保留，节点运行不受影响。");
+    })();
+  }
+  apply(engine: CoreName, generation: string, nodes: NodeConfig[], sample: TrafficSnapshot, now = Date.now()): void {
+    trafficSafeCount(now); trafficSafeCount(sample.up); trafficSafeCount(sample.down);
+    const old = this.baselines.get(engine);
+    const same = old?.generation === generation;
+    const reset = Boolean(same && engine === "singBox" && (sample.up < old.up || sample.down < old.down));
+    const previous = same && !reset ? old : undefined;
+    // Work on a copy; failures must not advance any baseline or lose a later retry's bytes.
+    const next: TrafficBaseline = { generation, at: now, up: sample.up, down: sample.down, nodes: new Map(previous?.nodes), connections: new Map(previous?.connections) };
+    const nodeMap = new Map(nodes.map(n => [n.id, trafficNodeDimension(engine, n)]));
+    const bucket = Math.floor(now / TRAFFIC_BUCKET_MS) * TRAFFIC_BUCKET_MS;
+    let up = engine === "xray" ? 0 : sample.up - (previous?.up ?? 0), down = engine === "xray" ? 0 : sample.down - (previous?.down ?? 0), nodeReset = false;
+    const increments: { dimension: TrafficDimension; up: number; down: number; seen: number }[] = [];
+    let limited = false;
+    const add = (dimension: TrafficDimension, up: number, down: number, seen = now) => increments.push({ dimension, up: trafficSafeCount(up), down: trafficSafeCount(down), seen });
+    for (const counter of sample.nodes) {
+      const dimension = nodeMap.get(counter.id); if (!dimension) continue;
+      trafficSafeCount(counter.up); trafficSafeCount(counter.down);
+      const baseline = previous?.nodes.get(counter.id);
+      const du = counter.up - (baseline && baseline.up <= counter.up ? baseline.up : 0), dd = counter.down - (baseline && baseline.down <= counter.down ? baseline.down : 0);
+      if (baseline && (baseline.up > counter.up || baseline.down > counter.down)) nodeReset = true;
+      add(dimension, du, dd);
+      if (engine === "xray") { up = trafficSafeCount(up + du); down = trafficSafeCount(down + dd); }
+      next.nodes.set(counter.id, { up: counter.up, down: counter.down });
+    }
+    add({ key: `core:${engine}`, kind: "core", engine, nodeId: "", name: engine === "xray" ? "Xray" : "sing-box", port: 0, protocol: "", ip: "", quality: "counter" }, up, down);
+    for (const c of sample.connections) {
+      const dimension = nodeMap.get(c.nodeId); if (!dimension) continue;
+      trafficSafeCount(c.up); trafficSafeCount(c.down);
+      const baseline = next.connections.get(c.id);
+      if (!baseline && next.connections.size >= 50000) { limited = true; continue; }
+      // A connection's cumulative counters must never decrease within a core generation.
+      if (baseline && (c.up < baseline.up || c.down < baseline.down)) { limited = true; continue; }
+      const du = c.up - (baseline?.up ?? 0), dd = c.down - (baseline?.down ?? 0);
+      // The API replays its closed-session cache. A replay is not new activity.
+      if (!c.closed || du || dd) {
+        const seen = c.closed && c.closedAt ? Math.min(trafficSafeCount(c.closedAt), now) : now;
+        add(dimension, du, dd, seen);
+        if (c.ip) add({ ...dimension, key: `${dimension.key}:${c.ip}`, kind: "peer", ip: c.ip }, du, dd, seen);
+      }
+      next.connections.set(c.id, { up: c.up, down: c.down, seen: now });
+    }
+    for (const p of sample.peers) {
+      const dimension = nodeMap.get(p.nodeId);
+      if (dimension && p.seenAt <= now + 60000 && p.seenAt >= now - TRAFFIC_RETENTION_MS) add({ ...dimension, key: `${dimension.key}:${p.ip}`, kind: "peer", ip: p.ip, quality: "presence" }, 0, 0, p.seenAt);
+    }
+    for (const [id, c] of next.connections) if (now - c.seen > 3600_000) next.connections.delete(id);
+    const elapsed = previous ? now - previous.at : 0;
+    const rateKnown = elapsed > 0 && elapsed <= TRAFFIC_INTERVAL_MS * 3;
+    this.db.transaction(() => {
+      const maintenance = now - this.lastPrune > 3600_000;
+      if (maintenance) {
+        this.db.query("DELETE FROM buckets WHERE bucket<?").run(now - TRAFFIC_RETENTION_MS);
+        this.db.query("DELETE FROM events WHERE at<?").run(now - TRAFFIC_RETENTION_MS);
+        this.db.query("DELETE FROM events WHERE rowid NOT IN (SELECT rowid FROM events ORDER BY at DESC LIMIT 1000)").run();
+      }
+      const count = (this.db.query("SELECT COUNT(*) n FROM buckets").get() as { n: number }).n;
+      const excess = count + increments.length - 200000;
+      if (excess > 0) {
+        this.db.query("DELETE FROM buckets WHERE rowid IN (SELECT rowid FROM buckets ORDER BY bucket LIMIT ?)").run(excess);
+        this.db.query("INSERT INTO events VALUES (?,?,?)").run(now, engine, "retention-limit");
+      }
+      if (maintenance || excess > 0) this.db.query("DELETE FROM dimensions WHERE key NOT IN (SELECT key FROM buckets)").run();
+      const putDimension = this.db.query("INSERT INTO dimensions VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET name=excluded.name");
+      for (const d of nodeMap.values()) putDimension.run(d.key, d.kind, d.engine, d.nodeId, d.name, d.port, d.protocol, d.ip, d.quality);
+      for (const { dimension: d, up, down, seen } of increments) {
+        putDimension.run(d.key, d.kind, d.engine, d.nodeId, d.name, d.port, d.protocol, d.ip, d.quality);
+        this.db.query("INSERT INTO buckets VALUES (?,?,?,?,?) ON CONFLICT(bucket,key) DO UPDATE SET up=up+excluded.up,down=down+excluded.down,seen=MAX(seen,excluded.seen)").run(d.quality === "presence" ? Math.floor(seen / TRAFFIC_BUCKET_MS) * TRAFFIC_BUCKET_MS : bucket, d.key, up, down, seen);
+      }
+      if (!same) this.db.query("INSERT INTO events VALUES (?,?,?)").run(now, engine, "generation");
+      if (reset || nodeReset) this.db.query("INSERT INTO events VALUES (?,?,?)").run(now, engine, "reset");
+      if (elapsed > TRAFFIC_INTERVAL_MS * 3 || elapsed < 0) this.db.query("INSERT INTO events VALUES (?,?,?)").run(now, engine, "gap");
+      const detail = limited ? "连接归属达到容量限制；核心累计量仍采集，节点/来源明细可能遗漏。" : engine === "singBox" ? "核心累计量；节点/来源为已观察连接的下限，采集间隔内超过 1000 个短连接可能遗漏归属。" : "按节点账号累计计数；来源 IP 仅提供近期出现线索，不提供按 IP 的字节数。";
+      this.db.query("INSERT OR REPLACE INTO status VALUES (?,?,?,'collecting',?,?,?,?)").run(engine, generation, now, detail, sample.peersAvailable ? 1 : 0, rateKnown ? up * 1000 / elapsed : null, rateKnown ? down * 1000 / elapsed : null);
+    })();
+    this.baselines.set(engine, next);
+    if (now - this.lastPrune > 3600_000) this.lastPrune = now;
+  }
+}
+
+/** Reads aggregate history without opening config.json or creating a database on first view. */
+export function readTrafficReport(paths: AppPaths, range: TrafficRange = "24h", now = Date.now()): TrafficReport {
+  if (!Object.hasOwn(TRAFFIC_RANGES, range)) throw new Error("无效的统计时间范围。");
+  const from = Math.floor((now - TRAFFIC_RANGES[range]) / TRAFFIC_BUCKET_MS) * TRAFFIC_BUCKET_MS;
+  const report: TrafficReport = { now, from, oldest: null, range, bucketMs: TRAFFIC_BUCKET_MS, retentionDays: 30, cores: [], nodes: [], peers: [], series: [], status: [], events: [], limited: false };
+  if (!trafficStoreFs.existsSync(trafficDatabasePath(paths))) return report;
+  trafficCheckDatabase(paths);
+  const db = new trafficSqlite.Database(trafficDatabasePath(paths), { readonly: true });
+  try {
+    db.exec("PRAGMA busy_timeout=1500; PRAGMA query_only=ON;");
+    if ((db.query("PRAGMA user_version").get() as { user_version: number }).user_version !== 1) throw new Error("统计数据库版本不兼容。");
+    db.transaction(() => {
+      report.oldest = (db.query("SELECT MIN(bucket) oldest FROM buckets").get() as { oldest: number | null }).oldest;
+      for (const kind of ["core", "node", "peer"] as const) {
+        const rows = db.query(`SELECT d.*,SUM(b.up) up,SUM(b.down) down,MAX(b.seen) lastSeen FROM buckets b JOIN dimensions d ON d.key=b.key WHERE b.bucket>=? AND b.bucket<=? AND d.kind=? GROUP BY d.key ORDER BY SUM(b.up)+SUM(b.down) DESC,lastSeen DESC LIMIT 501`).all(from, now, kind);
+        report[kind === "core" ? "cores" : kind === "node" ? "nodes" : "peers"] = rows.slice(0, 500);
+        if (rows.length > 500) report.limited = true;
+      }
+      const step = range === "1h" ? TRAFFIC_BUCKET_MS : range === "24h" ? 3600_000 : 86400_000;
+      report.series = db.query(`SELECT (b.bucket / ?) * ? bucket,d.engine,SUM(b.up) up,SUM(b.down) down FROM buckets b JOIN dimensions d ON d.key=b.key WHERE b.bucket>=? AND b.bucket<=? AND d.kind='core' GROUP BY 1,d.engine ORDER BY 1`).all(step, step, from, now);
+      report.status = db.query("SELECT * FROM status").all().map((row: any) => ({ ...row, state: row.state === "collecting" && (now - row.lastSeen > 30000 || row.lastSeen > now + 60000) ? "stale" : row.state }));
+      report.events = db.query("SELECT at,engine,code FROM events WHERE at>=? ORDER BY at DESC LIMIT 50").all(from);
+    })();
+    return report;
+  } finally { db.close(); }
+}
+
+
 // ==================== network.ts ====================
 import * as networkFs from "node:fs";
 import * as networkPath from "node:path";
@@ -2283,22 +2691,31 @@ export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsP
 }
 
 /** Check all selected cores before publishing any generated runtime configuration. */
-export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions } = {}): Promise<Binaries> {
+export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions; traffic?: Partial<Record<"xray" | "singBox", TrafficEndpoint>> } = {}): Promise<Binaries> {
   const c = validateConfig(config);
   if (!c.nodes.some(node => node.enabled)) throw new Error("没有启用的节点；请先创建或启用至少一个节点。");
   // 所有配置与 REALITY 地址先准备成功，再安装核心或写入候选文件；DNS 失败不改变原运行文件。
   const singConfig = buildSingBoxConfig(c), xrayConfig = await buildRuntimeXrayConfig(c, options.realityDns);
   const binaries = await ensureBinaries(paths, c, options.report, options.releases);
-  const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string }[] = [];
+  const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string; base: string; instrumented: boolean }[] = [];
   for (const [tool, path, generated] of [
     ["singBox", paths.singConfig, singConfig], ["xray", paths.xrayConfig, xrayConfig],
-  ] as const) if (generated) jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, text: JSON.stringify(generated, null, 2) + "\n" });
+  ] as const) if (generated) {
+    const base = JSON.stringify(generated, null, 2) + "\n", endpoint = options.traffic?.[tool];
+    jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, base, instrumented: Boolean(endpoint), text: endpoint ? JSON.stringify(withTrafficInstrumentation(generated, tool, endpoint), null, 2) + "\n" : base });
+  }
   try {
     for (const job of jobs) atomicWrite(job.candidate, job.text);
     const checks = await Promise.allSettled(jobs.map(async job => {
       const executable = binaries[job.tool]!;
       const args = job.tool === "singBox" ? ["check", "-c", job.candidate] : ["run", "-test", "-config", job.candidate];
-      const result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+      let result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+      if (result.code !== 0 && job.instrumented) {
+        // Older/custom cores may lack the optional API. Never sacrifice working proxy service for statistics.
+        job.text = job.base; atomicWrite(job.candidate, job.text);
+        result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+        if (result.code === 0) options.report?.(`${job.tool} 不支持可选统计接口，继续采用原核心配置；流量页面将显示不可用。`);
+      }
       if (result.code !== 0) {
         const detail = redact((result.stderr || result.stdout).trim(), collectConfigSecrets(c)).slice(-1500);
         throw new Error(`${job.tool === "singBox" ? "sing-box" : "Xray"} 配置检查失败：${detail || `退出码 ${result.code}`}`);
@@ -5450,6 +5867,10 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
   const abort = new AbortController();
   let server: ReturnType<typeof Bun.serve> | undefined;
   let logger: RotatingLogger | undefined;
+  let trafficStore: TrafficStore | undefined;
+  const trafficReservations: daemonNet.Server[] = [];
+  let trafficLoop: Promise<void> | undefined;
+  let finalTrafficPoll: (() => Promise<void>) | undefined;
   let stopRequested = false;
   const children = new Set<daemonCp.ChildProcess>();
   const loops: Promise<void>[] = [];
@@ -5465,7 +5886,8 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     const runtimeHash = runtimeConfigFingerprint(config);
     const enabled = config.nodes.filter(node => node.enabled);
     if (!enabled.length) throw new Error("没有已启用的节点。请先在面板创建或启用至少一个节点。");
-    logger = new RotatingLogger(paths.log, collectConfigSecrets(config));
+    const logSecrets = collectConfigSecrets(config);
+    logger = new RotatingLogger(paths.log, logSecrets);
     logger.write(`NexusEdge worker 启动，PID=${process.pid}，instance=${instanceId}，节点数=${enabled.length}`);
     daemonFs.mkdirSync(runDirectory, { mode: 0o700 });
     const runningPaths: AppPaths = {
@@ -5481,8 +5903,33 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     // do not install or claim ownership of real core binaries.
     const releases = (injectedAll && options.skipPreflight ? readCoreSelection(paths) : initializeCoreSelection(paths)).active;
     const releaseHash = coreReleaseFingerprint(releases);
+    const trafficEndpoints: Partial<Record<CoreName, TrafficEndpoint>> = {};
+    if (!options.skipPreflight) {
+      try {
+        trafficStore = new TrafficStore(paths);
+        for (const engine of engines) {
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const reserved = daemonNet.createServer(socket => socket.destroy());
+            trafficReservations.push(reserved);
+            await new Promise<void>((resolve, reject) => { reserved.once("error", reject); reserved.listen(0, "127.0.0.1", resolve); });
+            const address = reserved.address();
+            if (!address || typeof address === "string") throw new Error("无法保留统计端口。");
+            if (!enabled.some(n => n.port === address.port)) {
+              trafficEndpoints[engine] = { port: address.port, secret: daemonCrypto.randomBytes(32).toString("hex") };
+              logSecrets.push(trafficEndpoints[engine]!.secret); break;
+            }
+            await new Promise<void>(resolve => reserved.close(() => resolve()));
+          }
+          if (!trafficEndpoints[engine]) throw new Error("无法分配独立的统计端口。");
+        }
+      } catch {
+        logger.write("流量采集初始化失败；继续启动节点，可在流量页面检查历史记录。");
+        trafficStore?.close(); trafficStore = undefined;
+        for (const engine of engines) delete trafficEndpoints[engine];
+      }
+    }
     let binaries: Binaries = {};
-    if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases });
+    if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases, traffic: trafficEndpoints, report: message => logger!.write(message) });
     else if (!injectedAll) binaries = await ensureBinaries(paths, config, message => logger!.write(message), releases);
     if (abort.signal.aborted) return;
     let firewall: DaemonStatus["firewall"];
@@ -5563,7 +6010,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
       },
     });
     runtime.controlPort = server.port!;
-    const reservedPorts = new Set([...enabled.map(node => node.port), runtime.controlPort]);
+    const reservedPorts = new Set([...enabled.map(node => node.port), runtime.controlPort, ...Object.values(trafficEndpoints).map(e => e.port)]);
     // No tunnel means no cloudflared job, metrics listener or /ready request.
     for (const node of tunneled) {
       const command = options.tunnels?.[node.id] ?? (binaries.cloudflared ? { executable: binaries.cloudflared, args: [] } : undefined);
@@ -5718,6 +6165,27 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         await delay(options.healthIntervalMs ?? 1000, abort.signal);
       }
     };
+    for (const reserved of trafficReservations.splice(0)) if (reserved.listening) await new Promise<void>(resolve => reserved.close(() => resolve()));
+    if (trafficStore) {
+      let storeFailed = false;
+      const poll = async () => {
+        if (storeFailed) return;
+        await Promise.all(engines.map(async engine => {
+          const core = status.cores[engine]!, generation = `${instanceId}:${core.restarts}`;
+          try {
+            if (core.state !== "running") { trafficStore!.unavailable(engine, generation); return; }
+            const snapshot = await collectCoreTraffic(engine, trafficEndpoints[engine]!, enabled.filter(n => nodeEngine(n) === engine));
+            if (generation === `${instanceId}:${core.restarts}` && core.state === "running") trafficStore!.apply(engine, generation, enabled.filter(n => nodeEngine(n) === engine), snapshot);
+          } catch {
+            try { trafficStore!.unavailable(engine, generation); }
+            catch { storeFailed = true; logger!.write("流量记录暂不可写；采集已暂停，节点继续运行。"); }
+          }
+        }));
+      };
+      finalTrafficPoll = poll;
+      trafficLoop = (async () => { while (!abort.signal.aborted) { await poll(); await delay(TRAFFIC_INTERVAL_MS, abort.signal); } })();
+      loops.push(trafficLoop);
+    }
     for (const promise of [...jobs.map(supervise), monitor()]) loops.push(promise.catch(error => { fatalError = error; logger!.write(`守护异常：${errorMessage(error)}`); requestStop(); }));
     await stopPromise;
     status.phase = "stopping"; status.links = [];
@@ -5727,6 +6195,9 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
   } finally {
     try {
       requestStop();
+      // Flush while owned cores still run. Crashes can still lose the final sampling interval.
+      if (trafficLoop) await trafficLoop;
+      if (finalTrafficPoll) await finalTrafficPoll();
       // EOF on each host's stdin is its liveness signal. Hosts own and await their cores.
       for (const child of children) { try { child.stdin?.end(); } catch { /* Already exited. */ } }
       await daemonSettleWithin(loops, 12000);
@@ -5735,6 +6206,8 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         await daemonSettleWithin(loops, 3000);
       }
       if (server) await server.stop(true);
+      for (const reserved of trafficReservations) if (reserved.listening) await new Promise<void>(resolve => reserved.close(() => resolve()));
+      if (trafficStore) { try { trafficStore.stopped(); } catch { /* Statistics failure must not interfere with core shutdown. */ } trafficStore.close(); }
       const record = readRuntimeRecord(paths);
       if (record?.instanceId === instanceId) {
         daemonFs.rmSync(paths.runtimeState, { force: true });
@@ -7319,6 +7792,97 @@ export async function runBackupPanel(paths: AppPaths, overrides: Partial<BackupP
 }
 
 
+// ==================== traffic-web.ts ====================
+import * as trafficWebCrypto from "node:crypto";
+
+export const trafficDashboardHtml = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>流量分析 · NexusEdge</title><link rel="stylesheet" href="/style.css"></head>
+<body><aside><div class="brand"><span class="brand-icon">N</span>NexusEdge</div><div class="nav-label">本机洞察</div><a href="#overview" class="nav active">◫　流量概览</a><a href="#nodes" class="nav">⇄　节点与端口</a><a href="#peers" class="nav">◎　来源线索</a><div class="local-note"><span class="dot"></span> 仅本机回环访问<br><small>只读 · 无外部资源 · 不上传数据</small></div></aside>
+<main id="overview"><header><div><div class="eyebrow">NETWORK INSIGHTS</div><h1>流量分析</h1><p>从核心到端口，了解流量在哪里发生。</p></div><div class="live"><span id="state-dot" class="dot"></span><span id="state">正在连接</span><small id="updated"></small></div></header>
+<div id="error" role="alert" hidden></div><div id="empty" hidden><h2>还没有采集记录</h2><p>更新程序后，在主菜单手动启动 / 重启节点开始采集。首次计数约需 10 秒；打开此页面不会启动或重启节点。</p><p>过去未采集的流量无法回溯，包括 Windows 或云商此前记录的用量。</p></div>
+<div class="toolbar"><div id="engines" class="segmented"><button data-engine="all" aria-pressed="true">全部核心</button><button data-engine="xray" aria-pressed="false">Xray</button><button data-engine="singBox" aria-pressed="false">sing-box</button></div><div id="ranges" class="segmented"><button data-range="1h" aria-pressed="false">近 1 小时</button><button data-range="24h" aria-pressed="true">近 24 小时</button><button data-range="7d" aria-pressed="false">近 7 天</button><button data-range="30d" aria-pressed="false">近 30 天</button></div></div>
+<section class="cards"><article class="card primary"><div class="label">应用层总流量</div><div id="total" class="metric">—</div><small>上行 + 下行 · 非云商账单</small></article><article class="card"><div class="label"><span class="up-color">↑</span> 客户端上传</div><div id="up" class="metric">—</div><small>客户端 → 代理核心</small></article><article class="card"><div class="label"><span class="down-color">↓</span> 客户端下载</div><div id="down" class="metric">—</div><small>代理核心 → 客户端</small></article><article class="card"><div class="label">最近采样速率</div><div id="rate" class="metric small">—</div><small id="rate-detail">每 10 秒读取累计计数</small></article></section>
+<section class="panel"><div class="section-heading"><div><h2>流量趋势</h2><p id="coverage">等待本地记录</p></div><div class="legend"><span class="up-color">● 上传</span><span class="down-color">● 下载</span><span>○ 未观察</span></div></div><div id="chart" role="img" aria-label="双向流量趋势"></div><div id="chart-axis"></div><p class="fine">按采样时间归入 5 分钟桶，时间窗口起点向下取整。恢复采集后的补记不代表流量恰好发生在该时刻；空白区间不等于零流量。</p></section>
+<section id="nodes" class="panel"><div class="section-heading"><div><h2>节点与端口</h2><p>点选一行，查看该节点的来源线索。</p></div><input id="search" type="search" placeholder="查找节点、协议或端口" aria-label="查找节点或端口"></div><div class="table-wrap"><table><thead><tr><th>节点 / 协议</th><th>监听端口</th><th>核心 / 口径</th><th>上传</th><th>下载</th><th>占当前核心总量</th></tr></thead><tbody id="node-rows"></tbody></table></div><p id="node-note" class="fine"></p><div id="attribution" class="notice"></div></section>
+<section id="peers" class="panel"><div class="section-heading"><div><h2>来源线索 <span id="peer-filter" class="tag">全部节点</span></h2><p>来源 IP 不是设备身份；NAT、共享凭据和隧道都可能掩盖真实客户端。</p></div><button id="clear-node" class="text-button">清除节点筛选</button></div><div class="table-wrap"><table><thead><tr><th>来源 IP</th><th>节点 / 端口</th><th>观察到的上传</th><th>观察到的下载</th><th>最近出现</th></tr></thead><tbody id="peer-rows"></tbody></table></div><p class="fine">来源列表显示前 20 项。Xray 仅提供采样时仍在线的来源出现记录（短连接可能遗漏），无法将节点字节拆给不同 IP；sing-box 来源字节为已观察连接的下限。来源只留 IP、节点、时间和计数，不保存访问域名、目标地址或凭据。</p></section>
+<section class="bottom-grid"><article class="panel"><h2>采集状态</h2><div id="core-status"></div><div id="events"></div></article><article class="panel explanation"><h2>这些数字代表什么</h2><p>统计代理核心处理的应用层字节，不包含完整的 TLS、隧道、重传及系统流量；云商可能只计出站，也可能使用不同计费周期。</p><p>重启、崩溃、版本不支持或采集故障会影响覆盖范围。核心崩溃前最后一个采样间隔可能丢失，页面会保留已有历史。</p><p id="retention">最多保留 30 天，容量达到上限时较早记录会提前清理。</p></article></section>
+<footer><span>数据仅保存在当前安装目录 · 浏览器时间显示为本地时区</span><span id="expires"></span></footer></main><script src="/app.js" defer></script></body></html>`;
+
+export const trafficDashboardCss = `:root{font-family:Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#182c36;background:#f4f7f8;font-size:14px;--green:#147e6b;--blue:#4c7dd6;--line:#e5ebed}*{box-sizing:border-box}body{margin:0}aside{position:fixed;inset:0 auto 0 0;width:220px;background:#142b32;color:#d0dee0;padding:35px 23px}.brand{font-weight:750;font-size:22px;color:white;display:flex;gap:11px;align-items:center;letter-spacing:-.6px}.brand-icon{background:#a8e1c2;color:#153a30;border-radius:10px;padding:5px 11px}.nav-label{font-size:11px;letter-spacing:2px;margin:58px 12px 16px;color:#a0b9bf}.nav{display:block;text-decoration:none;color:#bdcdd1;padding:14px 12px;margin:7px 0;border-radius:8px}.nav.active,.nav:hover{background:#23414a;color:#fff}.local-note{position:absolute;bottom:30px;font-size:12px;line-height:2;color:#bad3d4}.local-note small{font-size:10px;color:#91acb3}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#2da77f;margin-right:6px}main{max-width:1540px;margin-left:220px;padding:40px 44px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}.eyebrow{font-size:10px;font-weight:700;letter-spacing:2px;color:#5d817d}h1{font-size:32px;letter-spacing:-1px;margin:9px 0 8px}p{color:#657984;line-height:1.7;margin:4px 0}h2{font-size:17px;letter-spacing:-.3px;margin:0 0 5px}.live{border:1px solid var(--line);background:white;border-radius:20px;padding:10px 16px;color:#35574e;font-size:12px}.live small{display:block;margin:5px 0 0 12px;color:#7b8992}.toolbar{display:flex;justify-content:space-between;gap:16px;margin-bottom:20px}.segmented{display:flex;background:#e9eff0;border:1px solid #e1e8ea;border-radius:9px;padding:3px;gap:3px}button{font:inherit;cursor:pointer;border:0;background:transparent;border-radius:6px;padding:9px 13px;color:#657680}button[aria-pressed=true]{background:#fff;color:#183b35;box-shadow:0 1px 3px #13263015;font-weight:600}button:focus-visible,a:focus-visible,input:focus-visible,tr:focus-visible{outline:3px solid #74b8cd;outline-offset:3px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}.card{padding:24px;background:white;border:1px solid var(--line);border-radius:12px}.card.primary{background:#173b38;color:white;border-color:#173b38}.label{font-size:12px;color:#6d7f86}.primary .label,.primary small{color:#b5d5ca}.metric{font-size:30px;font-weight:650;letter-spacing:-1px;margin:19px 0 11px;white-space:nowrap}.metric.small{font-size:24px}small{color:#809098;font-size:11px}.panel{background:white;border:1px solid var(--line);border-radius:12px;padding:25px 26px;margin-bottom:24px}.section-heading{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:22px}.section-heading p{font-size:12px}.legend{font-size:11px;white-space:nowrap;display:flex;gap:16px;color:#87959a}.up-color{color:var(--green)}.down-color{color:var(--blue)}#chart{height:220px;margin-top:12px}#chart svg{width:100%;height:100%}#chart-axis{display:flex;justify-content:space-between;color:#89989d;font-size:11px;margin:4px 0 20px}.fine{font-size:11px;line-height:1.9;margin-top:17px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px;text-align:left;white-space:nowrap}th{color:#829198;font-size:10px;font-weight:600;background:#f7f9fa;padding:12px 10px;border-bottom:1px solid var(--line)}td{padding:16px 10px;border-bottom:1px solid #eef2f3}td small{display:block;margin-top:5px}#node-rows tr{cursor:pointer}#node-rows tr:hover,#node-rows tr.selected{background:#edf6f2}.tag{display:inline-block;border-radius:5px;background:#edf3f3;font-weight:500;color:#5b7579;padding:4px 7px;font-size:10px;vertical-align:middle}.notice{font-size:12px;line-height:1.8;border-left:3px solid #78b7a4;padding:10px 14px;background:#f2f8f5;color:#54746b;margin-top:16px}input{border:1px solid #e1e8ea;border-radius:7px;padding:9px 12px;font:inherit;width:210px;background:#fafcfc}.text-button{color:var(--green);font-size:12px}.bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}.bottom-grid .panel{margin-bottom:12px}.explanation p{font-size:12px;margin-top:13px}.status-row{padding:13px 0;border-bottom:1px solid var(--line);font-size:12px}.status-row p{font-size:11px;margin-top:5px}.event{font-size:11px;color:#8a7664;margin-top:10px}.muted{color:#8b999e}.empty-row{text-align:center;color:#85979b;padding:35px}#error,#empty{padding:22px 26px;margin-bottom:22px;border-radius:10px;background:#fff2e9;color:#885d39;border:1px solid #eadaca}#empty{background:#eaf4ef;color:#2f6251;border-color:#d4e5dc}#empty p{color:inherit;font-size:12px}footer{display:flex;justify-content:space-between;gap:15px;font-size:10px;color:#81969a;margin-top:20px;padding-bottom:15px}#events{margin-top:14px}@media(max-width:1150px){aside{width:180px;padding:30px 16px}.brand{font-size:19px}main{margin-left:180px;padding:32px 24px}.metric{font-size:25px}.card{padding:20px 16px}.toolbar{flex-wrap:wrap}}@media(max-width:800px){aside{position:static;width:auto;padding:18px 22px}.brand{font-size:20px}.nav,.nav-label,.local-note{display:none}main{margin:0;padding:24px 18px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.bottom-grid{grid-template-columns:1fr;gap:10px}.section-heading{align-items:flex-start}.legend{gap:7px}header{gap:12px}h1{font-size:27px}.panel{padding:20px 16px}footer{flex-direction:column}#chart{height:180px}}@media(max-width:460px){button{font-size:11px;padding:9px}.metric{font-size:23px}.metric.small{font-size:20px}.live small{display:none}.section-heading{flex-wrap:wrap}.cards{gap:10px}.label{font-size:11px}}`;
+
+export const trafficDashboardJs = `"use strict";
+const $=id=>document.getElementById(id), token=location.hash.slice(1);let range="24h",engine="all",selected="",report=null,busy=false,queued=false,connected=false,expiresAt=0;
+function text(id,value){$(id).textContent=value}function el(tag,value,cls){const e=document.createElement(tag);if(value!==undefined)e.textContent=value;if(cls)e.className=cls;return e}
+function bytes(n){if(!Number.isFinite(n))return "—";const units=["B","KiB","MiB","GiB","TiB","PiB"];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return n.toLocaleString(undefined,{maximumFractionDigits:i?2:0})+" "+units[i]}
+function when(n){return new Date(n).toLocaleString(undefined,{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}function matches(r){return engine==="all"||r.engine===engine}function sum(rows,k){return rows.reduce((n,r)=>n+r[k],0)}
+function emptyRow(body,message,columns){const row=el("tr"),cell=el("td",message,"empty-row");cell.colSpan=columns;row.append(cell);body.append(row)}
+function chart(rows){const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");svg.setAttribute("viewBox","0 0 1000 210");svg.setAttribute("preserveAspectRatio","none");const step=report.range==="1h"?300000:report.range==="24h"?3600000:86400000;const first=Math.floor(report.from/step)*step,last=Math.floor(report.now/step)*step;const count=Math.round((last-first)/step)+1;const points=new Map();rows.forEach(r=>{const p=points.get(r.bucket)||{up:0,down:0};p.up+=r.up;p.down+=r.down;points.set(r.bucket,p)});const max=Math.max(1,...Array.from(points.values(),p=>p.up+p.down));function shape(tag,attrs){const x=document.createElementNS(svg.namespaceURI,tag);Object.entries(attrs).forEach(([k,v])=>x.setAttribute(k,String(v)));return x}for(let i=0;i<4;i++)svg.append(shape("line",{x1:0,x2:1000,y1:8+i*62,y2:8+i*62,stroke:"#e9eff1","stroke-dasharray":"3 5"}));for(let i=0;i<count;i++){const at=first+i*step,p=points.get(at),width=1000/count,x=i*width+width*.17;if(!p){svg.append(shape("circle",{cx:x+width*.33,cy:195,r:2,fill:"#bdc9cd"}));continue}const h1=p.up/max*175,h2=p.down/max*175;const g=shape("g",{}),title=shape("title",{});title.textContent=when(at)+" · 上传 "+bytes(p.up)+" / 下载 "+bytes(p.down);g.append(title,shape("rect",{x,y:195-h1,width:width*.66,height:h1,rx:2,fill:"#288d77"}),shape("rect",{x,y:195-h1-h2,width:width*.66,height:h2,rx:2,fill:"#6490de"}));svg.append(g)}$("chart").replaceChildren(svg);$("chart-axis").replaceChildren(el("span",when(first)),el("span","峰值 "+bytes(max)),el("span",when(last)))}
+function render(){if(!report)return;const cores=report.cores.filter(matches),nodes=report.nodes.filter(matches),status=report.status.filter(matches),total=sum(cores,"up")+sum(cores,"down");text("total",cores.length?bytes(total):"—");text("up",cores.length?bytes(sum(cores,"up")):"—");text("down",cores.length?bytes(sum(cores,"down")):"—");const fresh=connected&&status.length&&status.every(s=>s.state==="collecting");text("state",fresh?"正在采集":status.length?"采集未覆盖当前时刻":"等待采集");$("state-dot").style.background=fresh?"#2da77f":"#d3a253";const rateKnown=fresh&&status.every(s=>s.upRate!==null&&s.downRate!==null);text("rate",rateKnown?bytes(sum(status,"upRate")+sum(status,"downRate"))+"/s":"—");text("rate-detail",rateKnown?"↑ "+bytes(sum(status,"upRate"))+"/s　↓ "+bytes(sum(status,"downRate"))+"/s":"等待两个连续有效样本");text("updated","页面更新 "+new Date(report.now).toLocaleTimeString());$("empty").hidden=report.oldest!==null;text("coverage",report.oldest===null?"无记录；未采集期间不能补算":"现存最早归档 "+when(report.oldest)+" · 5 分钟粒度 · 中断期间不补造数据");chart(report.series.filter(matches));const body=$("node-rows");body.replaceChildren();const query=$("search").value.trim().toLowerCase();const filtered=nodes.filter(n=>(n.name+" "+n.port+" "+n.protocol).toLowerCase().includes(query));filtered.slice(0,20).forEach(n=>{const row=el("tr");row.tabIndex=0;if(selected===n.key)row.className="selected";const name=el("td",n.name);name.append(el("small",n.protocol.toUpperCase()));row.append(name,el("td",String(n.port)),el("td",(n.engine==="xray"?"Xray · 节点账号计数":"sing-box · 观察下限")),el("td",(n.quality==="observed"?"≥ ":"")+bytes(n.up)),el("td",(n.quality==="observed"?"≥ ":"")+bytes(n.down)),el("td",total?((n.up+n.down)/total*100).toFixed(1)+"%":"—"));const choose=()=>{selected=selected===n.key?"":n.key;render()};row.addEventListener("click",choose);row.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose()}});body.append(row)});if(!filtered.length)emptyRow(body,"此时间范围没有匹配节点记录",6);text("node-note",filtered.length>20?"显示前 20 / "+filtered.length+" 个节点，可按名称或端口查找。":"端口使用采集时的值；修改端口前后的记录分别展示。"+(report.limited?" 返回量已限制为各类前 500 项。":""));const singCore=cores.filter(n=>n.engine==="singBox"),singNodes=nodes.filter(n=>n.engine==="singBox");const unassigned=Math.max(0,sum(singCore,"up")+sum(singCore,"down")-sum(singNodes,"up")-sum(singNodes,"down"));text("attribution",singCore.length?"sing-box 核心累计量与已观察节点归属相差 "+bytes(unassigned)+"。短连接缓存、采集间隔及不同读取时刻可能影响归属；节点下限不可代替核心总量。":"Xray 按各节点账号的应用层字节累计计数。与 Windows 的进程用量、云商账单不是同一个统计口径。");const selectedNode=report.nodes.find(n=>n.key===selected);text("peer-filter",selectedNode?selectedNode.name+" :"+selectedNode.port:"全部节点");const peers=report.peers.filter(matches).filter(p=>!selected||p.key.startsWith(selected+":"));const peerBody=$("peer-rows");peerBody.replaceChildren();peers.slice(0,20).forEach(p=>{const row=el("tr");row.append(el("td",p.ip),el("td",p.name+" :"+p.port),el("td",p.quality==="presence"?"核心未提供":"≥ "+bytes(p.up)),el("td",p.quality==="presence"?"核心未提供":"≥ "+bytes(p.down)),el("td",when(p.lastSeen)));peerBody.append(row)});if(!peers.length)emptyRow(peerBody,"暂无来源记录；不能据此认定没有客户端",5);const states=$("core-status");states.replaceChildren();status.forEach(s=>{const row=el("div",(s.engine==="xray"?"Xray":"sing-box")+" · "+(s.state==="collecting"?"采集中":s.state==="stopped"?"后台已停止":s.state==="stale"?"记录已过期 / 后台可能停止":"接口不可用"),"status-row");row.append(el("p",s.detail),el("p",s.lastSeen?"最后成功 "+when(s.lastSeen):"尚无成功采样"));if(!s.peersAvailable)row.append(el("p","来源接口暂不可用，字节统计可独立继续。"));states.append(row)});if(!status.length)states.append(el("p","启动新版后台后自动采集。此页面仅查看数据。"));const labels={generation:"核心启动 / 新统计周期",reset:"核心计数归零；可能缺失重置前尾段",gap:"采样间隔异常 / 时钟变化",unavailable:"统计接口暂不可用", "retention-limit":"容量上限触发：提前清理较早记录"};$("events").replaceChildren(...report.events.filter(matches).slice(0,5).map(e=>el("div",when(e.at)+" · "+(labels[e.code]||"采集事件"),"event")));text("expires",expiresAt?"临时页面会话到期 "+new Date(expiresAt).toLocaleTimeString():"")}
+async function refresh(){if(busy){queued=true;return}busy=true;const requestedRange=range;try{if(!/^[a-f0-9]{64}$/.test(token))throw Error("请从终端复制完整的临时链接（包含 # 后的访问码）。");const response=await fetch("/api/report?range="+requestedRange,{headers:{Authorization:"Bearer "+token},cache:"no-store",signal:AbortSignal.timeout(5000)});if(!response.ok)throw Error(response.status===403?"访问码无效，请从菜单重新打开临时网页。":"无法读取统计记录，请检查本地数据目录或重新打开网页。");const data=await response.json();if(requestedRange!==range)return;connected=true;report=data.report;expiresAt=data.expiresAt;$("error").hidden=true;render()}catch(e){connected=false;text("rate","—");text("rate-detail","页面连接中断；保留最后一次历史结果");text("error",e.message+" 若临时服务已关闭或到期，请返回菜单重新启动。");$("error").hidden=false;text("state","页面连接中断");$("state-dot").style.background="#d3a253"}finally{busy=false;if(queued){queued=false;void refresh()}}}
+$("engines").addEventListener("click",e=>{const b=e.target.closest("button[data-engine]");if(!b)return;engine=b.dataset.engine;$("engines").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));render()});$("ranges").addEventListener("click",e=>{const b=e.target.closest("button[data-range]");if(!b)return;range=b.dataset.range;$("ranges").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));refresh()});$("search").addEventListener("input",render);$("clear-node").addEventListener("click",()=>{selected="";render()});refresh();setInterval(refresh,10000);
+`;
+
+/** On-demand read-only listener. Its random capability is unrelated to the daemon's control token. */
+export function startTrafficDashboard(paths: AppPaths, options: { lifetimeMs?: number } = {}): { url: string; port: number; expiresAt: number; close: () => Promise<void> } {
+  const token = trafficWebCrypto.randomBytes(32).toString("hex"), expiresAt = Date.now() + (options.lifetimeMs ?? 30 * 60_000);
+  let closed = false;
+  const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" };
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 1024, idleTimeout: 5,
+    fetch(request) {
+      const host = request.headers.get("Host"), allowed = [`127.0.0.1:${server.port}`, `localhost:${server.port}`];
+      const forbidden = () => new Response("Forbidden", { status: 403, headers });
+      if (closed || Date.now() >= expiresAt || !host || !allowed.includes(host)) return forbidden();
+      const origin = request.headers.get("Origin");
+      if (origin && origin !== `http://${host}`) return forbidden();
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers });
+      const url = new URL(request.url);
+      if (url.pathname === "/") return new Response(trafficDashboardHtml, { headers: { ...headers, "Content-Type": "text/html; charset=utf-8" } });
+      if (url.pathname === "/style.css") return new Response(trafficDashboardCss, { headers: { ...headers, "Content-Type": "text/css; charset=utf-8" } });
+      if (url.pathname === "/app.js") return new Response(trafficDashboardJs, { headers: { ...headers, "Content-Type": "text/javascript; charset=utf-8" } });
+      if (url.pathname !== "/api/report") return new Response("Not found", { status: 404, headers });
+      const actual = Buffer.from(request.headers.get("Authorization") ?? ""), expected = Buffer.from(`Bearer ${token}`);
+      if (actual.length !== expected.length || !trafficWebCrypto.timingSafeEqual(actual, expected)) return forbidden();
+      const range = url.searchParams.get("range") ?? "24h";
+      if (!Object.hasOwn(TRAFFIC_RANGES, range)) return new Response("Invalid range", { status: 400, headers });
+      try { return Response.json({ report: readTrafficReport(paths, range as TrafficRange), expiresAt }, { headers }); }
+      catch { return Response.json({ error: "本地统计数据库暂不可读；未修改原文件。" }, { status: 503, headers }); }
+    },
+    error() { return new Response("Local dashboard error", { status: 500, headers }); },
+  });
+  const close = async () => { if (closed) return; closed = true; clearTimeout(timer); await server.stop(true); };
+  const timer = setTimeout(() => { void close(); }, Math.max(1, expiresAt - Date.now())); timer.unref();
+  return { url: `http://127.0.0.1:${server.port}/#${token}`, port: server.port!, expiresAt, close };
+}
+
+
+// ==================== traffic-panel.ts ====================
+
+/** Shared Windows/Linux user entry; finally closes the listener on Back, Ctrl+C, or errors. */
+export async function runTrafficPanel(paths: AppPaths): Promise<void> {
+  for (;;) {
+    const report = readTrafficReport(paths);
+    const count = report.nodes.length;
+    const choice = await selectMenu("流量统计 / 分析", [
+      `近 24 小时有 ${count} 个节点 / 端口记录；${report.oldest === null ? "尚无采集数据" : "最早现存记录：" + new Date(report.oldest).toLocaleString()}`,
+      "新版后台启动后每 10 秒采集，按 5 分钟归档，最多保留 30 天；旧记录无法补算。",
+      "Xray 按节点账号计数；sing-box 节点与来源为观察下限；IP 是来源线索，不是设备身份。",
+      "应用层字节不等于 Windows 进程用量或云商账单。查看页面不会启停节点或修改防火墙。",
+    ].join("\n"), ["启动临时只读网页", "返回"]);
+    if (choice === 1) return;
+    const dashboard = startTrafficDashboard(paths);
+    try {
+      await selectMenu("流量分析网页已启动", [
+        "在这台电脑的浏览器打开以下完整链接（包括 # 后的访问码）：", dashboard.url,
+        "仅监听 127.0.0.1；30 分钟后自动到期。保留此菜单时可查看，关闭页面服务不停止后台采集。",
+        `通过 SSH 查看时，在自己电脑转发同一端口：ssh -L ${dashboard.port}:127.0.0.1:${dashboard.port} 用户@服务器`,
+        "然后在自己电脑打开同一链接。不要开放公网端口或分享临时链接。",
+      ].join("\n"), ["关闭临时网页并返回"]);
+    } finally { await dashboard.close(); }
+  }
+}
+
+
 // ==================== panel.ts ====================
 import * as panelFs from "node:fs";
 import * as panelPath from "node:path";
@@ -7961,8 +8525,8 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       ...(dirty ? ["已保存的配置或内核版本尚未应用。重启全部节点后生效。"] : []),
       ...(!config.nodes.length ? ["节点管理 → 新增节点：选协议 → 保存并应用。隧道默认关闭。"] : []),
     ].join("\n");
-    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "配置备份 / 迁移", "退出面板（保留后台）"]);
-    if (choice === 11) return "exit";
+    const choice = await selectMenu(`NexusEdge ${APP_VERSION} 节点管理`, information, ["启动 / 重启全部节点", "停止全部节点", "节点管理（新增 / 编辑 / 启停 / 删除）", "查看链接 / 导出客户端配置", "WARP 与通知设置", "查看运行日志", startup.enabled ? "关闭自动启动" : "开启自动启动", "内核管理 / 更新", "IPv6 / 防火墙设置", "卸载 NexusEdge", "配置备份 / 迁移", "流量统计 / 分析", "退出面板（保留后台）"]);
+    if (choice === 12) return "exit";
     try {
       if (choice === 0) {
         if (!enabled.length) throw new Error("没有启用的节点。请先进入节点管理添加或启用节点。");
@@ -7977,6 +8541,7 @@ export async function runPanel(paths: AppPaths): Promise<"exit" | "handoff" | "u
       else if (choice === 7) { await runCorePanel(paths); continue; }
       else if (choice === 8) { await panelNetworkSettings(paths); continue; }
       else if (choice === 10) await runBackupPanel(paths);
+      else if (choice === 11) { await runTrafficPanel(paths); continue; }
       else if (choice === 9) {
         const keep = await confirmUninstall(paths);
         if (keep === null) continue;
