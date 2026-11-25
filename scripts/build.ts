@@ -6,7 +6,7 @@ import { APP_VERSION } from "../src/core.ts";
 // 拼接相互隔离的源码模块，保留 TypeScript 类型；相对导入必须保持单行。
 // 命名空间导入名称互不冲突，生成的脚本无需 npm 运行时依赖。
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const files = ["core.ts", "address.ts", "presets.ts", "network.ts", "platform.ts", "ipv6.ts", "firewall-linux.ts", "firewall.ts", "firewall-control.ts", "daemon.ts", "migration.ts", "updates.ts", "ui.ts", "uninstall.ts", "ipv6-panel.ts", "firewall-panel.ts", "simple.ts", "core-panel.ts", "backup.ts", "backup-panel.ts", "panel.ts", "main.ts"];
+const files = ["core.ts", "address.ts", "presets.ts", "traffic-core.ts", "traffic-store.ts", "network.ts", "platform.ts", "ipv6.ts", "firewall-linux.ts", "firewall.ts", "firewall-control.ts", "daemon.ts", "migration.ts", "updates.ts", "ui.ts", "uninstall.ts", "ipv6-panel.ts", "firewall-panel.ts", "simple.ts", "core-panel.ts", "backup.ts", "backup-panel.ts", "traffic-web.ts", "traffic-panel.ts", "panel.ts", "main.ts"];
 const parts = files.map(file => {
   const source = readFileSync(join(root, "src", file), "utf8");
   const stripped = source.replace(/^import[^\n]*from ["']\.\/[^"']+["'];?\r?\n/gm, "");

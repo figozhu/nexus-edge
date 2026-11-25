@@ -10,6 +10,7 @@ import * as http2 from "node:http2";
 import { defaultConfig, createDefaultNode, generateClientConfig, generateNodeLinks, generateRealityKeyPair, nodeListenNetworks, runCommand } from "../src/core.ts";
 import type { CoreName, NodeConfig, NodeProtocol } from "../src/core.ts";
 import { buildSingBoxConfig, buildXrayConfig, compareCoreVersions, NETWORK_RELEASES } from "../src/network.ts";
+import { withTrafficInstrumentation, collectCoreTraffic } from "../src/traffic-core.ts";
 
 // Opt-in tests: authenticated local official binaries, loopback services only.
 // No download, Cloudflare/WARP traffic, daemon, or system service is used.
@@ -195,7 +196,9 @@ async function roundtrip(spec: RoundtripCase): Promise<void> {
       expect(new URL(link.uri!).searchParams.get("path")).toBe(node.transport.path);
     }
     const serverPath = path.join(directory, "server.json"), clientPath = path.join(directory, "client.json");
-    const generated = (engine === "xray" ? buildXrayConfig(config) : buildSingBoxConfig(config)) as any;
+    const traffic = process.env.NEXUS_EDGE_TEST_TRAFFIC === "1" ? { port: await freePort(), secret: crypto.randomBytes(32).toString("hex") } : undefined;
+    const baseGenerated = (engine === "xray" ? buildXrayConfig(config) : buildSingBoxConfig(config)) as any;
+    const generated = traffic ? withTrafficInstrumentation(baseGenerated, engine, traffic) as any : baseGenerated;
     // The newer Xray v26.10.17 preview blocks private destinations by default;
     // its loopback-only fixture needs this test-only allowance. Stable v26.3.27
     // runs with the production-generated outbound settings unchanged. Neither
@@ -224,6 +227,17 @@ async function roundtrip(spec: RoundtripCase): Promise<void> {
     const returned = response.body; expect(returned.byteLength).toBe(payload.byteLength);
     expect(crypto.createHash("sha256").update(returned).digest("hex")).toBe(crypto.createHash("sha256").update(payload).digest("hex"));
     expect(requests).toBe(1);
+    if (traffic) {
+      const snapshot = await collectCoreTraffic(engine, traffic, [node]);
+      expect(snapshot.up).toBeGreaterThanOrEqual(payload.byteLength);
+      expect(snapshot.down).toBeGreaterThanOrEqual(payload.byteLength);
+      const entries = engine === "xray" ? snapshot.nodes : snapshot.connections.filter(c => c.nodeId === node.id);
+      expect(entries.reduce((n, c) => n + c.up, 0)).toBeGreaterThanOrEqual(payload.byteLength);
+      expect(entries.reduce((n, c) => n + c.down, 0)).toBeGreaterThanOrEqual(payload.byteLength);
+      if (engine === "singBox") expect(snapshot.connections.some(c => c.ip === "127.0.0.1")).toBe(true);
+      const again = await collectCoreTraffic(engine, traffic, [node]);
+      expect(again.up).toBeGreaterThanOrEqual(snapshot.up); // Read-only polling must not reset counters.
+    }
   } catch (error) {
     throw new Error(`${error instanceof Error ? error.message : String(error)}\nOwned core diagnostics:\n${owned.map((core, index) => `${index === 0 ? "server" : "client"}: ${core.log}`).join("\n")}`);
   } finally {

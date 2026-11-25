@@ -1,6 +1,9 @@
 """在原生终端验收发布程序；无 Bun PATH，不接触已有系统安装或网络配置。"""
 import argparse
 import json
+import re
+import urllib.request
+import urllib.error
 import os
 from pathlib import Path
 import select
@@ -98,8 +101,41 @@ def verify(binary: Path, bun: str | None = None) -> None:
             recovery = list(config.parent.glob("config.json.pre-import.*.bak"))
             assert len(recovery) == 1 and recovery[0].read_bytes() == before
             send(b"\r", "退出面板（保留后台）")
-            send(b"l", "已退出面板")
+            before_traffic = config.read_bytes()
+            send(b"l", "启动临时只读网页")
+            send(b"a", "关闭临时网页并返回")
+            clean = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output)).replace(b"\r", b"").replace(b"\n", b"")
+            matches = re.findall(rb"http://127\.0\.0\.1:(\d+)/#([a-f0-9]{64})", clean)
+            assert matches, "Traffic menu did not display a complete loopback URL"
+            port, access = matches[-1]
+            base = "http://127.0.0.1:" + port.decode()
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(base, timeout=3) as page:
+                assert "流量分析" in page.read().decode()
+            request = urllib.request.Request(base + "/api/report", headers={"Authorization": "Bearer " + access.decode()})
+            with opener.open(request, timeout=3) as response:
+                assert json.load(response)["report"]["oldest"] is None
+            assert config.read_bytes() == before_traffic, "Read-only traffic menu changed configuration"
+            assert not (config.parent / "traffic.sqlite").exists(), "Viewing must not initialize collection"
+            send(b"a", "启动临时只读网页")
+            try:
+                opener.open(base, timeout=2)
+                raise AssertionError("Dashboard listener leaked after returning")
+            except urllib.error.URLError:
+                pass
+            send(b"b", "退出面板（保留后台）")
+            send(b"l", "启动临时只读网页")
+            send(b"a", "关闭临时网页并返回")
+            clean = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output)).replace(b"\r", b"").replace(b"\n", b"")
+            cancelled_port = re.findall(rb"http://127\.0\.0\.1:(\d+)/#[a-f0-9]{64}", clean)[-1]
+            send(b"\x03", "已退出面板")
             assert child.wait(timeout=10) == 0
+            try:
+                opener.open("http://127.0.0.1:" + cancelled_port.decode(), timeout=2)
+                raise AssertionError("Dashboard listener leaked after Ctrl+C")
+            except urllib.error.URLError:
+                pass
+            assert config.read_bytes() == before_traffic
             saved = json.loads(config.read_text(encoding="utf-8"))
             assert saved["nodes"] == [] and saved["coreIpv6"] is False
             assert saved["firewall"]["mode"] == "manual"
@@ -108,7 +144,7 @@ def verify(binary: Path, bun: str | None = None) -> None:
             assert not (portable / ".nexus-edge" / "runtime.json").exists()
             if os.name != "nt":
                 assert termios.tcgetattr(slave) == original
-            print("PASS 独立程序原生 PTY：无 Bun、中文目录、保存设置、加密导出导入、恢复副本、取消卸载、退出及终端恢复")
+            print("PASS 独立程序原生 PTY：无 Bun、中文目录、配置迁移、流量菜单/临时网页/关闭监听、取消卸载及终端恢复")
         finally:
             if os.name == "nt":
                 child.close()

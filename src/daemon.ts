@@ -11,6 +11,8 @@ import { type AppConfig, type AppPaths, type RuntimeRecord, type DaemonStatus, t
 import { ensureBinaries, preflightCores, buildCloudflaredArgs, readCoreSelection, initializeCoreSelection, coreReleaseFingerprint, type Binaries } from "./network.ts";
 import { syncFirewallBackground } from "./firewall-control.ts";
 import { type FirewallResult } from "./firewall.ts";
+import { collectCoreTraffic, type TrafficEndpoint } from "./traffic-core.ts";
+import { TrafficStore, TRAFFIC_INTERVAL_MS } from "./traffic-store.ts";
 
 export class InstanceBusyError extends Error {
   constructor() { super("同一数据目录已有守护进程占用。请从管理面板停止它；不要删除锁文件或根据旧 PID 杀进程。"); }
@@ -314,6 +316,10 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
   const abort = new AbortController();
   let server: ReturnType<typeof Bun.serve> | undefined;
   let logger: RotatingLogger | undefined;
+  let trafficStore: TrafficStore | undefined;
+  const trafficReservations: daemonNet.Server[] = [];
+  let trafficLoop: Promise<void> | undefined;
+  let finalTrafficPoll: (() => Promise<void>) | undefined;
   let stopRequested = false;
   const children = new Set<daemonCp.ChildProcess>();
   const loops: Promise<void>[] = [];
@@ -329,7 +335,8 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     const runtimeHash = runtimeConfigFingerprint(config);
     const enabled = config.nodes.filter(node => node.enabled);
     if (!enabled.length) throw new Error("没有已启用的节点。请先在面板创建或启用至少一个节点。");
-    logger = new RotatingLogger(paths.log, collectConfigSecrets(config));
+    const logSecrets = collectConfigSecrets(config);
+    logger = new RotatingLogger(paths.log, logSecrets);
     logger.write(`NexusEdge worker 启动，PID=${process.pid}，instance=${instanceId}，节点数=${enabled.length}`);
     daemonFs.mkdirSync(runDirectory, { mode: 0o700 });
     const runningPaths: AppPaths = {
@@ -345,8 +352,33 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
     // do not install or claim ownership of real core binaries.
     const releases = (injectedAll && options.skipPreflight ? readCoreSelection(paths) : initializeCoreSelection(paths)).active;
     const releaseHash = coreReleaseFingerprint(releases);
+    const trafficEndpoints: Partial<Record<CoreName, TrafficEndpoint>> = {};
+    if (!options.skipPreflight) {
+      try {
+        trafficStore = new TrafficStore(paths);
+        for (const engine of engines) {
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const reserved = daemonNet.createServer(socket => socket.destroy());
+            trafficReservations.push(reserved);
+            await new Promise<void>((resolve, reject) => { reserved.once("error", reject); reserved.listen(0, "127.0.0.1", resolve); });
+            const address = reserved.address();
+            if (!address || typeof address === "string") throw new Error("无法保留统计端口。");
+            if (!enabled.some(n => n.port === address.port)) {
+              trafficEndpoints[engine] = { port: address.port, secret: daemonCrypto.randomBytes(32).toString("hex") };
+              logSecrets.push(trafficEndpoints[engine]!.secret); break;
+            }
+            await new Promise<void>(resolve => reserved.close(() => resolve()));
+          }
+          if (!trafficEndpoints[engine]) throw new Error("无法分配独立的统计端口。");
+        }
+      } catch {
+        logger.write("流量采集初始化失败；继续启动节点，可在流量页面检查历史记录。");
+        trafficStore?.close(); trafficStore = undefined;
+        for (const engine of engines) delete trafficEndpoints[engine];
+      }
+    }
     let binaries: Binaries = {};
-    if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases });
+    if (!options.skipPreflight) binaries = await preflightCores(runningPaths, config, { releases, traffic: trafficEndpoints, report: message => logger!.write(message) });
     else if (!injectedAll) binaries = await ensureBinaries(paths, config, message => logger!.write(message), releases);
     if (abort.signal.aborted) return;
     let firewall: DaemonStatus["firewall"];
@@ -427,7 +459,7 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
       },
     });
     runtime.controlPort = server.port!;
-    const reservedPorts = new Set([...enabled.map(node => node.port), runtime.controlPort]);
+    const reservedPorts = new Set([...enabled.map(node => node.port), runtime.controlPort, ...Object.values(trafficEndpoints).map(e => e.port)]);
     // No tunnel means no cloudflared job, metrics listener or /ready request.
     for (const node of tunneled) {
       const command = options.tunnels?.[node.id] ?? (binaries.cloudflared ? { executable: binaries.cloudflared, args: [] } : undefined);
@@ -582,6 +614,27 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         await delay(options.healthIntervalMs ?? 1000, abort.signal);
       }
     };
+    for (const reserved of trafficReservations.splice(0)) if (reserved.listening) await new Promise<void>(resolve => reserved.close(() => resolve()));
+    if (trafficStore) {
+      let storeFailed = false;
+      const poll = async () => {
+        if (storeFailed) return;
+        await Promise.all(engines.map(async engine => {
+          const core = status.cores[engine]!, generation = `${instanceId}:${core.restarts}`;
+          try {
+            if (core.state !== "running") { trafficStore!.unavailable(engine, generation); return; }
+            const snapshot = await collectCoreTraffic(engine, trafficEndpoints[engine]!, enabled.filter(n => nodeEngine(n) === engine));
+            if (generation === `${instanceId}:${core.restarts}` && core.state === "running") trafficStore!.apply(engine, generation, enabled.filter(n => nodeEngine(n) === engine), snapshot);
+          } catch {
+            try { trafficStore!.unavailable(engine, generation); }
+            catch { storeFailed = true; logger!.write("流量记录暂不可写；采集已暂停，节点继续运行。"); }
+          }
+        }));
+      };
+      finalTrafficPoll = poll;
+      trafficLoop = (async () => { while (!abort.signal.aborted) { await poll(); await delay(TRAFFIC_INTERVAL_MS, abort.signal); } })();
+      loops.push(trafficLoop);
+    }
     for (const promise of [...jobs.map(supervise), monitor()]) loops.push(promise.catch(error => { fatalError = error; logger!.write(`守护异常：${errorMessage(error)}`); requestStop(); }));
     await stopPromise;
     status.phase = "stopping"; status.links = [];
@@ -591,6 +644,9 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
   } finally {
     try {
       requestStop();
+      // Flush while owned cores still run. Crashes can still lose the final sampling interval.
+      if (trafficLoop) await trafficLoop;
+      if (finalTrafficPoll) await finalTrafficPoll();
       // EOF on each host's stdin is its liveness signal. Hosts own and await their cores.
       for (const child of children) { try { child.stdin?.end(); } catch { /* Already exited. */ } }
       await daemonSettleWithin(loops, 12000);
@@ -599,6 +655,8 @@ export async function runDaemonWorker(paths: AppPaths, options: DaemonOptions = 
         await daemonSettleWithin(loops, 3000);
       }
       if (server) await server.stop(true);
+      for (const reserved of trafficReservations) if (reserved.listening) await new Promise<void>(resolve => reserved.close(() => resolve()));
+      if (trafficStore) { try { trafficStore.stopped(); } catch { /* Statistics failure must not interfere with core shutdown. */ } trafficStore.close(); }
       const record = readRuntimeRecord(paths);
       if (record?.instanceId === instanceId) {
         daemonFs.rmSync(paths.runtimeState, { force: true });

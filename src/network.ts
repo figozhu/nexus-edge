@@ -7,6 +7,7 @@ import * as networkZlib from "node:zlib";
 import * as networkSqlite from "bun:sqlite";
 import { assertSupportedPlatform, atomicWrite, ensureDataDir, runCommand, validateConfig, validateNode, validateWarpProfile, nodeEngine, normalizeConnectAddress, collectConfigSecrets, redact, isCoreIpv6Enabled } from "./core";
 import type { AppConfig, AppPaths, WarpProfile, NodeConfig } from "./core";
+import { withTrafficInstrumentation, type TrafficEndpoint } from "./traffic-core.ts";
 
 export interface NetworkAsset {
   asset: string;
@@ -962,22 +963,31 @@ export function buildCloudflaredArgs(node: NodeConfig, paths: AppPaths, metricsP
 }
 
 /** Check all selected cores before publishing any generated runtime configuration. */
-export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions } = {}): Promise<Binaries> {
+export async function preflightCores(paths: AppPaths, config: AppConfig, options: { releases?: CoreReleaseMap; publish?: boolean; report?: (message: string) => void; realityDns?: RuntimeXrayDnsOptions; traffic?: Partial<Record<"xray" | "singBox", TrafficEndpoint>> } = {}): Promise<Binaries> {
   const c = validateConfig(config);
   if (!c.nodes.some(node => node.enabled)) throw new Error("没有启用的节点；请先创建或启用至少一个节点。");
   // 所有配置与 REALITY 地址先准备成功，再安装核心或写入候选文件；DNS 失败不改变原运行文件。
   const singConfig = buildSingBoxConfig(c), xrayConfig = await buildRuntimeXrayConfig(c, options.realityDns);
   const binaries = await ensureBinaries(paths, c, options.report, options.releases);
-  const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string }[] = [];
+  const jobs: { tool: "singBox" | "xray"; path: string; candidate: string; text: string; base: string; instrumented: boolean }[] = [];
   for (const [tool, path, generated] of [
     ["singBox", paths.singConfig, singConfig], ["xray", paths.xrayConfig, xrayConfig],
-  ] as const) if (generated) jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, text: JSON.stringify(generated, null, 2) + "\n" });
+  ] as const) if (generated) {
+    const base = JSON.stringify(generated, null, 2) + "\n", endpoint = options.traffic?.[tool];
+    jobs.push({ tool, path, candidate: `${path}.${networkCrypto.randomUUID()}.candidate.json`, base, instrumented: Boolean(endpoint), text: endpoint ? JSON.stringify(withTrafficInstrumentation(generated, tool, endpoint), null, 2) + "\n" : base });
+  }
   try {
     for (const job of jobs) atomicWrite(job.candidate, job.text);
     const checks = await Promise.allSettled(jobs.map(async job => {
       const executable = binaries[job.tool]!;
       const args = job.tool === "singBox" ? ["check", "-c", job.candidate] : ["run", "-test", "-config", job.candidate];
-      const result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+      let result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+      if (result.code !== 0 && job.instrumented) {
+        // Older/custom cores may lack the optional API. Never sacrifice working proxy service for statistics.
+        job.text = job.base; atomicWrite(job.candidate, job.text);
+        result = await runCommand(executable, args, { cwd: networkPath.dirname(executable), timeoutMs: 20_000 });
+        if (result.code === 0) options.report?.(`${job.tool} 不支持可选统计接口，继续采用原核心配置；流量页面将显示不可用。`);
+      }
       if (result.code !== 0) {
         const detail = redact((result.stderr || result.stdout).trim(), collectConfigSecrets(c)).slice(-1500);
         throw new Error(`${job.tool === "singBox" ? "sing-box" : "Xray"} 配置检查失败：${detail || `退出码 ${result.code}`}`);
