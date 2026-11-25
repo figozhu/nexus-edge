@@ -19,6 +19,7 @@ export const trafficDashboardCss = `:root{font-family:Inter,"Segoe UI","Microsof
 
 export const trafficDashboardJs = `"use strict";
 const $=id=>document.getElementById(id), token=location.hash.slice(1);let range="24h",engine="all",selected="",report=null,busy=false,queued=false,connected=false,expiresAt=0;
+document.querySelectorAll("aside a.nav").forEach(a=>a.addEventListener("click",e=>{e.preventDefault();document.getElementById(a.hash.slice(1))?.scrollIntoView({behavior:"smooth"})}));
 function text(id,value){$(id).textContent=value}function el(tag,value,cls){const e=document.createElement(tag);if(value!==undefined)e.textContent=value;if(cls)e.className=cls;return e}
 function bytes(n){if(!Number.isFinite(n))return "—";const units=["B","KiB","MiB","GiB","TiB","PiB"];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return n.toLocaleString(undefined,{maximumFractionDigits:i?2:0})+" "+units[i]}
 function when(n){return new Date(n).toLocaleString(undefined,{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}function matches(r){return engine==="all"||r.engine===engine}function sum(rows,k){return rows.reduce((n,r)=>n+r[k],0)}

@@ -36,6 +36,8 @@ try {
   assert.match(await page.locator("#node-rows").innerText(), /443/); assert.match(await page.locator("#node-rows").innerText(), /8943/);
   assert.ok(await page.locator("#chart svg rect").count() > 10);
   assert.match(await page.locator("#peer-rows").innerText(), /核心未提供/);
+  await page.locator('aside a[href="#peers"]').click();
+  assert.equal(page.url(), dashboard.url, "Sidebar navigation must preserve the access-code fragment for reloads");
   const screenshotDir = process.env.NEXUS_EDGE_SCREENSHOTS ? resolve(process.env.NEXUS_EDGE_SCREENSHOTS) : undefined;
   if (screenshotDir) {
     mkdirSync(screenshotDir, { recursive: true });
